@@ -4,6 +4,10 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
 <title>Aramex Gatehouse Register</title>
+<link rel="manifest" href="/aramex-gatehouse-system/manifest.json">
+<meta name="theme-color" content="#C8102E">
+<link rel="apple-touch-icon" href="/aramex-gatehouse-system/icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -40,6 +44,25 @@
       async list(prefix, shared) { const p = PREFIX + (prefix || ""); const keys = Object.keys(localStorage).filter((k) => k.startsWith(p)).map((k) => k.slice(PREFIX.length)); return { keys, prefix, shared: !!shared }; },
     };
   })();
+</script>
+<script>
+  // Installable app (PWA): register the service worker and tell the user when a new version is ready.
+  if ("serviceWorker" in navigator && location.protocol === "https:" && location.pathname.indexOf("/aramex-gatehouse-system/") === 0) {
+    window.addEventListener("load", function () {
+      var hadController = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.register("/aramex-gatehouse-system/sw.js", { scope: "/aramex-gatehouse-system/" }).then(function (reg) {
+        setInterval(function () { reg.update().catch(function () {}); }, 3600000);
+      }).catch(function (e) { console.warn("Service worker registration failed", e); });
+      navigator.serviceWorker.addEventListener("controllerchange", function () {
+        if (!hadController) { hadController = true; return; }
+        var bar = document.createElement("div");
+        bar.style.cssText = "position:fixed;bottom:0;left:0;right:0;z-index:300;background:#1F2933;color:#fff;padding:12px 16px;font:14px Inter,system-ui,sans-serif;display:flex;justify-content:space-between;align-items:center;gap:10px";
+        bar.innerHTML = "<span>A new version of the Gatehouse Register is ready.</span><button style=\"background:#E4002B;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-weight:700;cursor:pointer\">Reload</button>";
+        bar.querySelector("button").onclick = function () { location.reload(); };
+        document.body.appendChild(bar);
+      });
+    });
+  }
 </script>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
@@ -117,7 +140,7 @@ const FONT_MONO = "'JetBrains Mono', 'SF Mono', Consolas, monospace";
 --------------------------------------------------------------------- */
 const isViewer = (x) => !!x && (x.role === "manager" || x.role === "security_manager");
 const isMgmt = (x) => !!x && (x.role === "admin" || x.role === "supervisor");
-const LOADING_VIEWS = ["dashboard", "visitors", "handover", "incidents", "sealreg", "settings"];
+const LOADING_VIEWS = ["dashboard", "alerts", "visitors", "handover", "incidents", "sealreg", "settings"];
 const uid = (p = "") => p + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 
 async function sha256(text) {
@@ -1301,6 +1324,7 @@ function App() {
     setActiveLocationId(saved && ids.includes(saved) ? saved : (ids[0] || null));
   }, [session]);
 
+  const openSource = (loc, v) => { changeLocation(loc); setView(v); };
   const changeLocation = (locationId) => {
     if (locationId === SEAL_LOCATION_ID && !LOADING_VIEWS.includes(view)) setView("dashboard");
     setActiveLocationId(locationId);
@@ -1592,6 +1616,9 @@ function getLocationCollection(db, locationId, collectionName) {
           <IncidentsScreen session={session} incidents={incidents} persistIncidents={persist.incidents}
             settings={settings} persistSettings={persist.settings} notify={notify} />
         )}
+        {view === "alerts" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
+          <AlertsScreen session={session} getDb={() => dbApiRef.current} notify={notify} openSource={openSource} />
+        )}
         {view === "employees" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
           <EmployeesScreen employees={employees} persistEmployees={persist.employees} notify={notify} canEdit={session.role === "admin"} />
         )}
@@ -1707,6 +1734,7 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
 function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
   const items = [
     { id: "dashboard", label: "Dashboard", icon: Home, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "alerts", label: "Alerts", icon: AlertTriangle, roles: ["admin","supervisor","manager","security_manager"] },
     { id: "checkin", label: "Check In", icon: DoorOpen, roles: ["admin","supervisor","guard"] },
     { id: "checkout", label: "Check Out", icon: DoorClosed, roles: ["admin","supervisor","guard"] },
     { id: "attendance", label: "Today", icon: ClipboardList, roles: ["admin","supervisor","manager","security_manager","guard"] },
@@ -6409,6 +6437,282 @@ function EmployeeReport({ employees, attendance, settings }) {
 /* ---------------------------------------------------------------------
    SETTINGS (admin)
 --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   ALERTS & DISCREPANCIES — derived from the original records (nothing is copied).
+   Management workflow lives in locations/{loc}/alertActions/{key} (+ /events, append-only).
+--------------------------------------------------------------------- */
+const SEV_RANK = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+const ALERT_CATS = { incident: "Incident", pending: "Pending handover", discrepancy: "Handover discrepancy", shipment: "Damaged shipment", seal: "Broken seal" };
+const dubaiDay = (ms) => new Date(ms + 4 * 3600000).toISOString().slice(0, 10);
+const dubaiStartMs = (d) => (d ? Date.parse(d + "T00:00:00+04:00") : NaN);
+const tsMs = (t) => (t && t.toMillis ? t.toMillis() : Number(t) || 0);
+const dubaiStamp = (ms) => (ms ? new Date(ms).toLocaleString("en-GB", { timeZone: "Asia/Dubai", dateStyle: "medium", timeStyle: "short" }) : "—");
+
+function siteOfLocation(id, meta, regions) {
+  const m = meta[id] || {};
+  if (m.regionId && regions[m.regionId]) return { key: m.regionId, name: regions[m.regionId].name };
+  if (String(id).startsWith("DFC-")) return { key: "dfc", name: "DFC — Dubai Flower Centre" };
+  return { key: "other", name: "Other locations" };
+}
+
+function deriveAlerts(loc, d, startMs, hours) {
+  const out = [], act = d.actions || {}, now = Date.now();
+  const inScope = (r) => !isNaN(startMs) && (Number(r.created_at) || 0) >= startMs;
+  const flow = (cat, src, r, sev, text, by) => {
+    const key = src + "_" + r.id, w = act[key] || null, resolved = !!w && w.status === "RESOLVED";
+    out.push({ key, loc, cat, src, srcId: r.id, rec: r, sev: (w && w.severity_override) || sev, status: w ? w.status : "NEW", resolved, resolvedAt: resolved ? tsMs(w.resolved_at) : 0, when: Number(r.created_at) || 0, by: by || "—", text, w });
+  };
+  [...(d.incidents || []), ...(d.incidentsDone || [])].forEach((r) => {
+    const key = "incidents_" + r.id, w = act[key] || null, closed = r.status === "Resolved" || r.status === "Closed";
+    out.push({ key, loc, cat: "incident", src: "incidents", srcId: r.id, rec: r, sev: (w && w.severity_override) || String(r.severity || "Low").toUpperCase(), status: closed ? "RESOLVED" : (w ? w.status : "NEW"), resolved: closed, resolvedAt: closed ? Number(r.updated_at) || 0 : 0, when: Number(r.created_at) || 0, by: r.reported_by || "—", text: `${r.type}: ${r.description || ""}`, w });
+  });
+  (d.pending || []).filter(inScope).forEach((r) => {
+    const age = now - (Number(r.created_at) || 0), overdue = age > hours * 3600000;
+    out.push({ key: "handoverRecords_" + r.id + "#pending", loc, cat: "pending", src: "handoverRecords", srcId: r.id, rec: r, sev: overdue ? "MEDIUM" : "LOW", status: overdue ? "OVERDUE" : "PENDING", resolved: false, derivedOnly: true, overdue, when: Number(r.created_at) || 0, by: r.outgoing_guard || "—", text: `Handover to ${r.incoming_guard_expected || "—"} waiting ${fmtAgeMs(age)}` });
+  });
+  (d.disc || []).filter(inScope).forEach((r) => flow("discrepancy", "handoverRecords", r, "MEDIUM", `${r.discrepancy_count || ""} item(s) missing or short — ${r.outgoing_guard || ""} → ${r.incoming_guard_expected || ""}`, r.outgoing_guard));
+  (d.ship || []).filter(inScope).forEach((r) => flow("shipment", "shipments", r, "MEDIUM", `${shipRef(r)} — ${r.damage_notes || "damage reported"}`, r.damage_reported_by || r.received_by));
+  (d.seals || []).filter(inScope).forEach((r) => flow("seal", "loadingLogs", r, "HIGH", `Seal ${r.seal_number} broken — ${r.driver_name || ""}${r.vehicle_number ? " · " + r.vehicle_number : ""}`, r.recorded_by));
+  return out;
+}
+
+async function runAlertAction(db, session, a, action, note, outcome) {
+  const ts = () => window.firebase.firestore.FieldValue.serverTimestamp();
+  const base = `locations/${a.loc}/alertActions/${a.key}`, prev = a.w ? a.w.status : "NEW", evId = uid("ev_");
+  const to = { ACKNOWLEDGE: "ACKNOWLEDGED", INVESTIGATE: "INVESTIGATING", RESOLVE: "RESOLVED", REOPEN: "INVESTIGATING", NOTE: prev }[action];
+  const res = to === "RESOLVED" ? { resolved_by: session.name, resolved_by_uid: session.id, resolved_at: ts(), outcome, resolution_notes: note } : {};
+  const b = db.batch();
+  if (!a.w) {
+    b.set(db.doc(base), { alert_key: a.key, source_collection: a.src, source_id: a.srcId, status: to, severity_override: null, assigned_to: "", assigned_to_uid: "", acknowledged_by: session.name, acknowledged_by_uid: session.id, acknowledged_at: ts(), last_event_id: evId, created_at: ts(), created_by_uid: session.id, updated_at: ts(), updated_by_uid: session.id, ...res });
+  } else {
+    const reopen = action === "REOPEN" ? { resolved_by: null, resolved_by_uid: null, resolved_at: null } : {};
+    b.update(db.doc(base), { status: to, last_event_id: evId, updated_at: ts(), updated_by_uid: session.id, ...res, ...reopen });
+  }
+  b.set(db.doc(`${base}/events/${evId}`), { alert_key: a.key, at: ts(), by: session.name, by_uid: session.id, by_role: session.role, action, from_status: prev, to_status: to, note: note || "" });
+  await b.commit();
+}
+
+function AlertDetail({ a, session, canTriage, getDb, notify, openSource, onClose }) {
+  const [events, setEvents] = useState(null);
+  const [imgs, setImgs] = useState([]);
+  const [note, setNote] = useState("");
+  const [outcome, setOutcome] = useState("");
+  const [busy, setBusy] = useState(false);
+  const base = `locations/${a.loc}`;
+  useEffect(() => {
+    let off = false;
+    const db = getDb();
+    if (!db) return undefined;
+    if (!a.derivedOnly) db.collection(`${base}/alertActions/${a.key}/events`).orderBy("at").get().then((s) => { if (!off) setEvents(s.docs.map((x) => x.data())); }).catch(() => { if (!off) setEvents([]); });
+    const paths = a.cat === "shipment" ? (a.rec.photo_ids || []).map((p) => `${base}/shipmentPhotos/${p}`) : (a.cat === "seal" && a.rec.has_photo ? [`${base}/loadingPhotos/${a.rec.id}`] : []);
+    Promise.all(paths.map((p) => db.doc(p).get())).then((ss) => { if (!off) setImgs(ss.filter((x) => x.exists).map((x) => x.data().image)); }).catch(() => {});
+    return () => { off = true; };
+  }, [a.key]);
+  const prev = a.w ? a.w.status : "NEW";
+  const isInc = a.cat === "incident";
+  const can = canTriage && !a.derivedOnly;
+  const act = async (action) => {
+    if (action === "RESOLVE" && (!outcome.trim() || !note.trim())) { notify("Enter the outcome and resolution notes", "error"); return; }
+    if (action === "NOTE" && !note.trim()) { notify("Write a note first", "error"); return; }
+    setBusy(true);
+    try { await runAlertAction(getDb(), session, a, action, note.trim(), outcome.trim()); notify("Alert updated"); onClose(); }
+    catch (e) { console.error(e); notify(describeFirestoreError(e, "save this action"), "error"); setBusy(false); }
+  };
+  const srcView = { incidents: "incidents", handoverRecords: "handover", shipments: "shipments", loadingLogs: "sealreg" }[a.src];
+  const btn = (action, label, tone) => <Btn key={action} size="sm" tone={tone || "navy"} onClick={() => act(action)} disabled={busy}>{label}</Btn>;
+  return (
+    <Modal title={ALERT_CATS[a.cat]} onClose={onClose} wide>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+        <Badge tone={a.sev === "CRITICAL" || a.sev === "HIGH" ? "missing" : a.sev === "MEDIUM" ? "overtime" : "neutral"}>{a.sev}</Badge>
+        <Badge tone={a.resolved ? "inside" : "neutral"}>{a.status.replace("_", " ")}</Badge>
+      </div>
+      <div style={{ fontSize: 13.5, color: C.ink, marginBottom: 8, lineHeight: 1.5 }}>{a.text}</div>
+      <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 10 }}>{a.loc} · {dubaiStamp(a.when)} · reported by {a.by} · ref <span style={{ fontFamily: FONT_MONO }}>{a.key}</span></div>
+      {imgs.map((src, i) => <img key={i} src={src} alt="Evidence" style={{ width: "100%", borderRadius: 8, marginBottom: 8 }} />)}
+      <Btn size="sm" tone="paper" onClick={() => { onClose(); openSource(a.loc, srcView); }}>View original record</Btn>
+      {a.derivedOnly && <div style={{ fontSize: 12, color: C.ink50, marginTop: 10 }}>This alert closes automatically when the handover is accepted or cancelled.</div>}
+      {isInc && <div style={{ fontSize: 12, color: C.ink50, marginTop: 10 }}>An incident is resolved only in the Incidents module; this alert follows its status.</div>}
+      {can && (
+        <div style={{ borderTop: `1px dashed ${C.line}`, marginTop: 14, paddingTop: 12 }}>
+          {(prev !== "RESOLVED" || session.role === "admin") && !(a.resolved && isInc) && (
+            <>
+              <Field label="Note (required to resolve)"><textarea style={{ ...inputStyle, minHeight: 56 }} value={note} onChange={(e) => setNote(e.target.value)} /></Field>
+              {!isInc && prev !== "RESOLVED" && <Field label="Outcome (required to resolve)"><input style={inputStyle} value={outcome} onChange={(e) => setOutcome(e.target.value)} /></Field>}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {prev === "NEW" && btn("ACKNOWLEDGE", "Acknowledge")}
+                {(prev === "NEW" || prev === "ACKNOWLEDGED") && btn("INVESTIGATE", "Under investigation")}
+                {(prev === "ACKNOWLEDGED" || prev === "INVESTIGATING") && btn("NOTE", "Add note", "paper")}
+                {!isInc && prev !== "RESOLVED" && btn("RESOLVE", "Mark resolved", "green")}
+                {prev === "RESOLVED" && session.role === "admin" && btn("REOPEN", "Reopen", "red")}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+      {!a.derivedOnly && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 6 }}>Action history</div>
+          {events === null ? <div style={{ fontSize: 12, color: C.ink50 }}>Loading…</div> : events.length === 0 ? <div style={{ fontSize: 12, color: C.ink50 }}>No management actions yet.</div> : events.map((e, i) => (
+            <div key={i} style={{ fontSize: 12.5, padding: "6px 0", borderBottom: `1px solid ${C.line}` }}><b>{e.action}</b> by {e.by} ({e.by_role}) · {dubaiStamp(tsMs(e.at))}{e.note ? ` — ${e.note}` : ""}</div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function AlertsScreen({ session, getDb, notify, openSource }) {
+  const ids = Array.isArray(session.locationIds) ? session.locationIds : [];
+  const canTriage = session.role === "admin" || session.role === "security_manager";
+  const [data, setData] = useState({});
+  const [meta, setMeta] = useState({});
+  const [regions, setRegions] = useState({});
+  const [cfg, setCfg] = useState({});
+  const [errs, setErrs] = useState([]);
+  const [clock, setClock] = useState(0);
+  const [openSites, setOpenSites] = useState({});
+  const [detail, setDetail] = useState(null);
+  const [startDate, setStartDate] = useState("");
+  const [f, setF] = useState({ view: "open", loc: "", cat: "", sev: "", status: "", q: "", from: "", to: "" });
+  const set = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.value }));
+
+  useEffect(() => { const t = setInterval(() => setClock((c) => c + 1), 60000); return () => clearInterval(t); }, []);
+  useEffect(() => {
+    const db = getDb();
+    if (!db) return undefined;
+    let off = false;
+    const stops = [];
+    const put = (loc, k, v) => setData((p) => ({ ...p, [loc]: { ...(p[loc] || {}), [k]: v } }));
+    const bad = (loc, k) => (e) => { if (!off) setErrs((p) => [...p, `${loc} — ${k}: ${describeFirestoreError(e, "read")}`]); };
+    const docs = (s) => s.docs.map((d) => ({ ...d.data(), id: d.id }));
+    const cutoff = Date.now() - 30 * 86400000;
+    ids.forEach((loc) => {
+      const c = (n) => db.collection(`locations/${loc}/${n}`);
+      stops.push(c("incidents").where("status", "in", ["Open", "Under Investigation"]).onSnapshot((s) => put(loc, "incidents", docs(s)), bad(loc, "incidents")));
+      stops.push(c("incidents").where("status", "in", ["Resolved", "Closed"]).where("updated_at", ">=", cutoff).onSnapshot((s) => put(loc, "incidentsDone", docs(s)), bad(loc, "resolved incidents (needs the composite index)")));
+      stops.push(c("handoverRecords").where("status", "==", "PENDING").onSnapshot((s) => put(loc, "pending", docs(s)), bad(loc, "pending handovers")));
+      stops.push(c("handoverRecords").where("has_discrepancy", "==", true).onSnapshot((s) => put(loc, "disc", docs(s)), bad(loc, "handover discrepancies")));
+      stops.push(c("shipments").where("damaged", "==", true).onSnapshot((s) => put(loc, "ship", docs(s)), bad(loc, "damaged shipments")));
+      if (loc === SEAL_LOCATION_ID) stops.push(c("loadingLogs").where("seal_status", "==", "BROKEN").onSnapshot((s) => put(loc, "seals", docs(s)), bad(loc, "seal logs")));
+      stops.push(c("alertActions").onSnapshot((s) => put(loc, "actions", Object.fromEntries(s.docs.map((d) => [d.id, d.data()]))), bad(loc, "alert workflow")));
+      db.doc(`locations/${loc}`).get().then((s) => { if (!off && s.exists) setMeta((p) => ({ ...p, [loc]: s.data() })); }).catch(() => {});
+      db.doc(`locations/${loc}/config/app`).get().then((s) => { if (!off) setCfg((p) => ({ ...p, [loc]: (s.exists && s.data().alerts) || {} })); }).catch(() => { if (!off) setCfg((p) => ({ ...p, [loc]: {} })); });
+    });
+    db.collection("regions").get().then((s) => { if (!off) setRegions(Object.fromEntries(s.docs.map((d) => [d.id, d.data()]))); }).catch(() => {});
+    return () => { off = true; stops.forEach((x) => { try { x(); } catch (e) { /* ignore */ } }); };
+  }, [ids.join("|")]);
+
+  const all = useMemo(() => ids.flatMap((loc) => deriveAlerts(loc, data[loc] || {}, dubaiStartMs((cfg[loc] || {}).start_date), (cfg[loc] || {}).pending_overdue_hours || 2)), [data, cfg, clock]);
+  const open = all.filter((a) => !a.resolved);
+  const today = dubaiDay(Date.now());
+  const histCut = Date.now() - 30 * 86400000;
+  const noStart = ids.filter((l) => cfg[l] && !cfg[l].start_date);
+  const siteOf = (l) => siteOfLocation(l, meta, regions);
+  const rows = all.filter((a) => {
+    if (f.view === "open" ? a.resolved : !(a.resolved && a.resolvedAt >= histCut)) return false;
+    if (f.loc && a.loc !== f.loc) return false;
+    if (f.cat && a.cat !== f.cat) return false;
+    if (f.sev && a.sev !== f.sev) return false;
+    if (f.status && a.status !== f.status) return false;
+    if (f.from && dubaiDay(a.when) < f.from) return false;
+    if (f.to && dubaiDay(a.when) > f.to) return false;
+    if (f.q.trim() && ![a.text, a.by, a.key, a.loc].some((v) => String(v || "").toLowerCase().includes(f.q.trim().toLowerCase()))) return false;
+    return true;
+  }).sort((x, y) => (SEV_RANK[x.sev] - SEV_RANK[y.sev]) || (y.when - x.when));
+  const sites = {};
+  ids.forEach((l) => { const s = siteOf(l); (sites[s.key] = sites[s.key] || { name: s.name, locs: [] }).locs.push(l); });
+  const soon = Object.values(regions).filter((r) => r.status === "coming_soon");
+
+  const saveStart = async () => {
+    if (!startDate) return;
+    try {
+      await Promise.all(ids.map((l) => getDb().doc(`locations/${l}/config/app`).set({ alerts: { ...(cfg[l] || {}), start_date: startDate } }, { merge: true })));
+      setCfg((p) => Object.fromEntries(ids.map((l) => [l, { ...(p[l] || {}), start_date: startDate }])));
+      notify("Alerts start date saved");
+    } catch (e) { notify(describeFirestoreError(e, "save the start date"), "error"); }
+  };
+
+  return (
+    <div>
+      <SectionTitle title="Operational Alerts & Discrepancies" sub="Centralized monitoring of security operations across all your locations" />
+      {errs.length > 0 && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 12.5, color: C.redDeep, marginBottom: 12 }}>{[...new Set(errs)].slice(0, 4).map((e, i) => <div key={i}>{e}</div>)}</div>}
+      {noStart.length > 0 && (
+        <div style={{ background: "#FEF3C7", border: "1px solid #FDE68A", borderRadius: 10, padding: "12px 14px", marginBottom: 12, fontSize: 12.5, color: C.amberDeep }}>
+          <b>Alerts start date is not set for {noStart.join(", ")}.</b> Until it is, only incidents are listed; handover, shipment and seal alerts stay hidden so old records do not flood the dashboard.
+          {session.role === "admin" && (
+            <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+              <input type="date" style={{ ...inputStyle, maxWidth: 170, background: "#fff" }} value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+              <Btn size="sm" tone="navy" onClick={saveStart} disabled={!startDate}>Set start date</Btn>
+            </div>
+          )}
+        </div>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 10, marginBottom: 16 }}>
+        <StatCard label="Critical alerts" value={open.filter((a) => a.sev === "CRITICAL").length} icon={AlertTriangle} tone="red" />
+        <StatCard label="High priority" value={open.filter((a) => a.sev === "HIGH").length} icon={AlertTriangle} tone="amber" />
+        <StatCard label="Medium priority" value={open.filter((a) => a.sev === "MEDIUM").length} icon={AlertTriangle} tone="slate" />
+        <StatCard label="Total open" value={open.length} icon={ClipboardList} tone="navy" />
+        <StatCard label="Pending handovers" value={open.filter((a) => a.cat === "pending").length} icon={RefreshCw} tone="teal" />
+        <StatCard label="Overdue handovers" value={open.filter((a) => a.overdue).length} icon={Clock} tone="red" />
+        <StatCard label="Resolved today" value={all.filter((a) => a.resolved && dubaiDay(a.resolvedAt) === today).length} icon={CheckCircle2} tone="green" />
+      </div>
+
+      <SectionTitle title="Sites and locations" />
+      <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, marginBottom: 16, overflow: "hidden" }}>
+        {Object.entries(sites).map(([k, s]) => {
+          const n = s.locs.reduce((t, l) => t + open.filter((a) => a.loc === l).length, 0);
+          return (
+            <div key={k} style={{ borderBottom: `1px solid ${C.line}` }}>
+              <button onClick={() => setOpenSites((p) => ({ ...p, [k]: !p[k] }))} style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "11px 14px", background: "none", border: "none", cursor: "pointer", fontSize: 14, fontWeight: 700, color: C.ink }}>
+                <span>{openSites[k] ? "▾" : "▸"} {s.name}</span><Badge tone={n ? "missing" : "inside"}>{n} OPEN</Badge>
+              </button>
+              {openSites[k] && s.locs.map((l) => (
+                <button key={l} onClick={() => setF((x) => ({ ...x, loc: x.loc === l ? "" : l }))} style={{ width: "100%", display: "flex", justifyContent: "space-between", padding: "8px 14px 8px 32px", background: f.loc === l ? C.paperDim : "none", border: "none", cursor: "pointer", fontSize: 13, color: C.ink }}>
+                  <span>{(meta[l] && meta[l].displayName) || l}</span><span style={{ fontFamily: FONT_MONO }}>{open.filter((a) => a.loc === l).length}</span>
+                </button>
+              ))}
+            </div>
+          );
+        })}
+        {soon.flatMap((r) => (r.placeholder_sites || []).map((n) => (
+          <div key={r.name + n} style={{ display: "flex", justifyContent: "space-between", padding: "9px 14px", fontSize: 13, color: C.ink50, borderBottom: `1px solid ${C.line}` }}><span>{n}</span><span>Not yet activated</span></div>
+        )))}
+      </div>
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+        {[["open", `Open (${open.length})`], ["history", "Resolved (30 days)"]].map(([k, l]) => (
+          <button key={k} onClick={() => setF((x) => ({ ...x, view: k }))} style={{ padding: "7px 12px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer", border: `1px solid ${f.view === k ? C.navy : C.line}`, background: f.view === k ? C.navy : "#fff", color: f.view === k ? "#fff" : C.ink }}>{l}</button>
+        ))}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 8, marginBottom: 12 }}>
+        <select style={inputStyle} value={f.loc} onChange={set("loc")} aria-label="Location"><option value="">All locations</option>{ids.map((l) => <option key={l} value={l}>{l}</option>)}</select>
+        <select style={inputStyle} value={f.cat} onChange={set("cat")} aria-label="Category"><option value="">All categories</option>{Object.entries(ALERT_CATS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select>
+        <select style={inputStyle} value={f.sev} onChange={set("sev")} aria-label="Severity"><option value="">All severities</option>{["CRITICAL", "HIGH", "MEDIUM", "LOW"].map((s) => <option key={s} value={s}>{s}</option>)}</select>
+        <select style={inputStyle} value={f.status} onChange={set("status")} aria-label="Status"><option value="">All statuses</option>{["NEW", "ACKNOWLEDGED", "INVESTIGATING", "RESOLVED", "PENDING", "OVERDUE"].map((s) => <option key={s} value={s}>{s}</option>)}</select>
+        <input type="date" style={inputStyle} value={f.from} onChange={set("from")} aria-label="From" />
+        <input type="date" style={inputStyle} value={f.to} onChange={set("to")} aria-label="To" />
+        <input style={inputStyle} value={f.q} onChange={set("q")} placeholder="Search text, reporter, reference…" />
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {rows.length === 0 ? <EmptyState icon={CheckCircle2} title={f.view === "open" ? "No open alerts" : "Nothing resolved in the last 30 days"} sub="Every figure here comes from your real records." /> : rows.map((a) => (
+          <button key={a.key} onClick={() => setDetail(a)} style={{ textAlign: "left", width: "100%", background: a.sev === "CRITICAL" ? "#FEF2F2" : "#fff", border: `1px solid ${C.line}`, borderLeft: `4px solid ${a.sev === "CRITICAL" || a.sev === "HIGH" ? C.red : a.sev === "MEDIUM" ? C.amber : C.line}`, borderRadius: 10, padding: "11px 13px", cursor: "pointer" }}>
+            <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+              <Badge tone={a.sev === "CRITICAL" || a.sev === "HIGH" ? "missing" : a.sev === "MEDIUM" ? "overtime" : "neutral"}>{a.sev}</Badge>
+              <Badge tone="neutral">{ALERT_CATS[a.cat].toUpperCase()}</Badge>
+              <Badge tone={a.resolved ? "inside" : a.overdue ? "missing" : "neutral"}>{a.status.replace("_", " ")}</Badge>
+              <span style={{ marginLeft: "auto", fontSize: 11.5, color: C.ink50 }}>{dubaiStamp(a.when)}</span>
+            </div>
+            <div style={{ fontSize: 13.5, fontWeight: a.sev === "CRITICAL" || a.sev === "HIGH" ? 700 : 500, color: C.ink, marginTop: 6 }}>{a.text}</div>
+            <div style={{ fontSize: 12, color: C.ink50, marginTop: 3 }}>{siteOf(a.loc).name} · {a.loc} · reported by {a.by}</div>
+          </button>
+        ))}
+      </div>
+      {detail && <AlertDetail a={detail} session={session} canTriage={canTriage} getDb={getDb} notify={notify} openSource={openSource} onClose={() => setDetail(null)} />}
+    </div>
+  );
+}
+
 function UserEditForm({ user, onClose, onSave }) {
   const [name, setName] = useState(user.name);
   const [username, setUsername] = useState(user.username);
