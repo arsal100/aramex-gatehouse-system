@@ -1589,6 +1589,7 @@ function getLocationCollection(db, locationId, collectionName) {
       `}</style>
       <Toast toast={toast} />
       <Header
+  vw={vw}
   session={session}
   onLogout={async () => {
     const auth = authApiRef.current;
@@ -1621,7 +1622,7 @@ function getLocationCollection(db, locationId, collectionName) {
           <Dashboard
             session={session} employees={employees} attendance={attendance} settings={settings}
             empById={empById} today={today} goto={setView} sendReport={sendReport} leaves={leaves}
-            stockItems={stockItems} stockMovements={stockMovements} visitors={visitors} handoverRecords={handoverRecords} incidents={incidents} shipments={shipments} activeLocationId={activeLocationId} brokenSeals={brokenSeals}
+            stockItems={stockItems} stockMovements={stockMovements} visitors={visitors} handoverRecords={handoverRecords} incidents={incidents} shipments={shipments} activeLocationId={activeLocationId} brokenSeals={brokenSeals} vw={vw}
           />
         )}
         {view === "checkin" && (
@@ -1737,9 +1738,39 @@ function getLocationCollection(db, locationId, collectionName) {
    Aramex-branded top bar (red wordmark + "Gatehouse Register" subtitle)
    with a bottom tab bar, icon + name on every tab.
 --------------------------------------------------------------------- */
-function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId, onLocationChange }) {
+function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId, onLocationChange, vw }) {
   const dotColor = syncMode === "firebase" ? "#10B981" : syncMode === "synced" ? (canWriteShared === false ? C.amberDeep : "#10B981") : C.ink50;
   const syncLabel = syncMode === "firebase" ? "Synced via Firebase" : syncMode === "synced" ? (canWriteShared === false ? "Synced · read-only" : "Synced across devices") : "Local device only";
+
+  if (vw >= 640) {
+    const loc = syncMode === "firebase" && activeLocationId ? (
+      Array.isArray(session.locationIds) && session.locationIds.length > 1 ? (
+        <select value={activeLocationId} onChange={(e) => onLocationChange(e.target.value)} aria-label="Location" style={{ fontFamily: FONT_MONO, fontSize: 12, padding: "5px 8px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.45)", background: "rgba(255,255,255,0.16)", color: "#fff" }}>
+          {session.role !== "guard" && <option value="__ALL__" style={{ color: "#111" }}>All locations</option>}
+          {session.locationIds.map((id) => <option key={id} value={id} style={{ color: "#111" }}>{id}</option>)}
+        </select>
+      ) : <span style={{ fontFamily: FONT_MONO, fontSize: 12, color: "#fff" }}>{activeLocationId}</span>
+    ) : null;
+    return (
+      <header className="no-print" style={{ background: `linear-gradient(90deg, ${C.aramexRed}, #B0001F 60%, #8C001E)`, height: 64, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, padding: "0 20px", position: "sticky", top: 0, zIndex: 50, marginLeft: -(vw >= 1024 ? 220 : 76), boxShadow: "0 2px 10px rgba(228,0,43,0.3)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, minWidth: 0 }}>
+          <div style={{ fontFamily: FONT_SANS, fontSize: 28, fontWeight: 800, color: "#fff", letterSpacing: -1, textTransform: "lowercase", lineHeight: 1 }}>aramex</div>
+          <span style={{ width: 1, height: 30, background: "rgba(255,255,255,0.45)" }} />
+          <div style={{ fontFamily: FONT_SANS, fontSize: vw >= 1024 ? 18 : 15, fontWeight: 700, color: "#fff", whiteSpace: "nowrap" }}>Gatehouse Register System</div>
+          {loc}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {vw >= 1024 && <span style={{ fontFamily: FONT_MONO, fontSize: 10, color: "rgba(255,255,255,0.8)", display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: dotColor, display: "inline-block" }} />{syncLabel.toUpperCase()}</span>}
+          <div style={{ width: 36, height: 36, borderRadius: "50%", background: "rgba(255,255,255,0.18)", display: "flex", alignItems: "center", justifyContent: "center" }}><Users size={18} color="#fff" /></div>
+          <div style={{ textAlign: "left" }}>
+            <div style={{ fontSize: 13.5, fontWeight: 700, color: "#fff", lineHeight: 1.2 }}>{session.name}</div>
+            <div style={{ fontFamily: FONT_MONO, fontSize: 10, color: "rgba(255,255,255,0.85)" }}>{session.role.toUpperCase()}</div>
+          </div>
+          <button onClick={onLogout} title="Log out" style={{ background: "rgba(255,255,255,0.16)", border: "none", borderRadius: 7, padding: 8, cursor: "pointer", color: "#fff" }}><LogOut size={17} /></button>
+        </div>
+      </header>
+    );
+  }
 
   return (
     <header className="no-print" style={{
@@ -1814,11 +1845,10 @@ function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
   ].filter((i) => i.roles.includes(role) && i.show !== false && (locationId !== SEAL_LOCATION_ID || LOADING_VIEWS.includes(i.id)) && (locationId !== ALL_LOC || ALL_VIEWS.includes(i.id)));
 
   return (
-    <nav className="no-print" style={vw >= 640 ? { position: "fixed", top: 0, bottom: 0, left: 0, width: vw >= 1024 ? 220 : 76, background: "#0B1F3A", display: "flex", flexDirection: "column", overflowY: "auto", zIndex: 45 } : {
+    <nav className="no-print" style={vw >= 640 ? { position: "fixed", top: 64, bottom: 0, left: 0, width: vw >= 1024 ? 220 : 76, background: "#0B1F3A", borderTop: `3px solid ${C.aramexRed}`, display: "flex", flexDirection: "column", overflowY: "auto", zIndex: 45 } : {
       position: "fixed", bottom: 0, left: 0, right: 0, background: "#fff", borderTop: `1px solid ${C.line}`,
       display: "flex", overflowX: "auto", zIndex: 40, boxShadow: "0 -4px 14px rgba(15,23,42,0.08)",
     }}>
-      {vw >= 640 && <div style={{ padding: "16px 14px 14px", color: "#fff", fontWeight: 800, letterSpacing: 1, fontSize: vw >= 1024 ? 19 : 11 }}><span style={{ color: C.aramexRed }}>ARAMEX</span>{vw >= 1024 && <div style={{ fontSize: 11, fontWeight: 500, opacity: 0.7, letterSpacing: 0 }}>Gatehouse Register</div>}</div>}
       {items.map((it) => {
         const active = view === it.id;
         return (
@@ -1832,6 +1862,7 @@ function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
           </button>
         );
       })}
+    {vw >= 640 && <div style={{ marginTop: "auto", background: `linear-gradient(135deg, ${C.aramexRed}, #8C001E)`, color: "#fff", fontFamily: FONT_SERIF, fontStyle: "italic", fontSize: vw >= 1024 ? 13.5 : 9, lineHeight: 1.35, padding: vw >= 1024 ? "18px 16px" : "10px 6px", textAlign: "center", fontWeight: 600 }}>{vw >= 1024 ? <>Trusted Guards<br />Secure Gates</> : "Secure Gates"}</div>}
     </nav>
   );
 }
@@ -2061,7 +2092,7 @@ function LoginScreen({ authError, onClearAuthError, notify }) {
 /* ---------------------------------------------------------------------
    DASHBOARD
 --------------------------------------------------------------------- */
-function Dashboard({ session, employees, attendance, settings, empById, today, goto, sendReport, leaves, stockItems, stockMovements, visitors, handoverRecords, incidents, shipments, activeLocationId, brokenSeals }) {
+function Dashboard({ session, employees, attendance, settings, empById, today, goto, sendReport, leaves, stockItems, stockMovements, visitors, handoverRecords, incidents, shipments, activeLocationId, brokenSeals, vw }) {
   const todays = attendance.filter((a) => a.date === today);
   const inside = todays.filter((a) => a.status === "INSIDE");
   const checkedOutToday = todays.filter((a) => a.status === "CHECKED_OUT");
@@ -2083,6 +2114,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
   const shipThreshold = settings.shipment_threshold_days || 3;
   const shipmentsInWh = (shipments || []).filter((x) => x.status === "IN_WAREHOUSE");
   const overdueShipments = shipmentsInWh.filter((x) => shipmentState(x, shipThreshold) === "OVERDUE");
+  const isMobile = vw < 640;
   const isAll = activeLocationId === ALL_LOC;
   const locLabel = isAll ? "" : (activeLocationId || "");
   const nav = (v) => (isAll ? undefined : () => goto(v));
@@ -2131,6 +2163,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
 
   return (
     <div>
+      {isMobile && (
       <div style={{
         background: "#fff", borderRadius: 18, marginBottom: 22, border: `1px solid ${C.line}`,
         boxShadow: "0 2px 10px rgba(15,23,42,0.07)", display: "flex", overflow: "hidden", minHeight: 150,
@@ -2154,6 +2187,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
           </div>
         </div>
       </div>
+      )}
 
       {staleInside.length > 0 && (
         <div style={{ background: "#FEF3C7", border: `1px solid #FDE68A`, borderRadius: 10, padding: "12px 14px", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
@@ -2242,6 +2276,25 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
         </div>
       )}
 
+      {isMobile ? (
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 22 }}>
+        <StatCard label="Total Employees" value={activeEmployees.length} icon={Users} tone="red" onClick={isMgmt(session) ? () => goto("employees") : undefined} />
+        <StatCard label="Checked In Today" value={todays.length} icon={CalendarDays} tone="teal" onClick={() => goto("attendance")} />
+        <StatCard label="Currently Inside" value={inside.length} icon={Clock} tone="amber" onClick={() => goto("attendance")} />
+        <StatCard label="Checked Out Today" value={checkedOutToday.length} icon={DoorClosed} tone="slate" onClick={() => goto("attendance")} />
+        <StatCard label="Not Checked In" value={notCheckedIn.length} icon={XCircle} tone="red" onClick={() => goto("attendance")} />
+        <StatCard label="On Leave Today" value={onLeaveToday.length} icon={UserX} tone="slate" onClick={nav("leave")} />
+        <StatCard label="In Overtime" value={overtimeToday.length} icon={AlertTriangle} tone="amber" onClick={() => goto("attendance")} />
+        <StatCard label="Visitors/Contractors Inside" value={visitorsInside.length} icon={UserPlus} tone="purple" onClick={nav("visitors")} />
+        <StatCard label="Low Stock Items" value={lowStockItems.length} icon={Package} tone="slate" onClick={nav("inventory")} />
+        <StatCard label="Shipments in Warehouse" value={shipmentsInWh.length} icon={Truck} tone="teal" onClick={nav("shipments")} />
+        <StatCard label="Overdue Shipments" value={overdueShipments.length} icon={Clock} tone={overdueShipments.length ? "red" : "slate"} onClick={nav("shipments")} />
+        <StatCard label="Damaged Shipments" value={damagedShip.length} icon={AlertTriangle} tone={damagedShip.length ? "red" : "slate"} onClick={nav("shipments")} />
+        <StatCard label="Open Incidents" value={openIncidents.length} icon={AlertTriangle} tone="red" onClick={nav("incidents")} />
+      </div>
+
+      ) : (
+      <>
       <SectionTitle title="Security Operations Overview" sub={isAll ? "Consolidated across all your authorized locations" : locLabel} />
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 12, marginBottom: 22 }}>
         {opsCards.map((k) => <KpiCard key={k.label} {...k} />)}
@@ -2305,7 +2358,11 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
       </div>
 
       
-<SectionTitle title="Currently Inside" sub={`${inside.length} on site`} />
+
+      </>
+      )}
+
+      <SectionTitle title="Currently Inside" sub={`${inside.length} on site`} />
       <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", marginBottom: 22 }}>
         {inside.length === 0 ? <EmptyState icon={DoorOpen} title="No one is currently inside" /> : (
           <TableScroll headers={["Employee", "ID", "Company", "Time In", "Duration"]}>
