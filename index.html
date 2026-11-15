@@ -1008,7 +1008,8 @@ function App() {
   const [firebaseError, setFirebaseError] = useState("");
   const [activeLocationId, setActiveLocationId] = useState(null); // Firebase mode only
   const [dataError, setDataError] = useState("");
-  const [roster, setRoster] = useState([]); // guards at the active location (Firebase mode)
+  const [roster, setRoster] = useState([]);
+  const [brokenSeals, setBrokenSeals] = useState([]); // guards at the active location (Firebase mode)
   const activeLocationIdRef = useRef(null); activeLocationIdRef.current = activeLocationId;
   const dbApiRef = useRef(null);
   const [vw, setVw] = useState(window.innerWidth);
@@ -1457,6 +1458,14 @@ function App() {
     };
   }, [session, activeLocationId]);
 
+  // Broken seals for the dashboard (Loading Area only).
+  useEffect(() => {
+    const db = dbApiRef.current;
+    if (dbModeRef.current !== "firebase" || !db || !session || activeLocationId !== SEAL_LOCATION_ID) { if (activeLocationId !== ALL_LOC) setBrokenSeals([]); return undefined; }
+    const stop = db.collection(`locations/${SEAL_LOCATION_ID}/loadingLogs`).where("seal_status", "==", "BROKEN").onSnapshot((snap) => setBrokenSeals(snap.docs.map((d) => ({ ...d.data(), id: d.id }))), () => setBrokenSeals([]));
+    return () => { try { stop(); } catch (e) { /* ignore */ } };
+  }, [session, activeLocationId]);
+
   // ALL LOCATIONS (read-only overview): lighter queries per location, merged into the same lists the dashboard already uses.
   useEffect(() => {
     const db = dbApiRef.current;
@@ -1478,7 +1487,7 @@ function App() {
         setEmployees(cat("employees", (r, l) => ({ ...r, name: `${r.name} · ${l}`, _loc: l })));
         setAttendance(dedupe([...cat("attToday"), ...cat("attInside")]));
         setLeaves(cat("leaves")); setVisitors(cat("visitors")); setStockItems(cat("stockItems")); setStockMovements(cat("stockMovements"));
-        setHandoverRecords(cat("pending")); setIncidents(cat("incidents")); setShipments(dedupe([...cat("shipWh"), ...cat("shipDmg")]));
+        setHandoverRecords(dedupe([...cat("pending"), ...cat("disc")])); setBrokenSeals(cat("seals")); setIncidents(cat("incidents")); setShipments(dedupe([...cat("shipWh"), ...cat("shipDmg")]));
       }, 60);
     };
     const sub = (loc, key, q) => stops.push(q.onSnapshot(
@@ -1495,6 +1504,8 @@ function App() {
       sub(loc, "stockItems", c("stockItems"));
       sub(loc, "stockMovements", c("stockMovements"));
       sub(loc, "pending", c("handoverRecords").where("status", "==", "PENDING"));
+      sub(loc, "disc", c("handoverRecords").where("has_discrepancy", "==", true));
+      if (loc === SEAL_LOCATION_ID) sub(loc, "seals", c("loadingLogs").where("seal_status", "==", "BROKEN"));
       sub(loc, "incidents", c("incidents").where("status", "in", ["Open", "Under Investigation"]));
       sub(loc, "shipWh", c("shipments").where("status", "==", "IN_WAREHOUSE"));
       sub(loc, "shipDmg", c("shipments").where("damaged", "==", true));
@@ -1610,7 +1621,7 @@ function getLocationCollection(db, locationId, collectionName) {
           <Dashboard
             session={session} employees={employees} attendance={attendance} settings={settings}
             empById={empById} today={today} goto={setView} sendReport={sendReport} leaves={leaves}
-            stockItems={stockItems} stockMovements={stockMovements} visitors={visitors} handoverRecords={handoverRecords} incidents={incidents} shipments={shipments}
+            stockItems={stockItems} stockMovements={stockMovements} visitors={visitors} handoverRecords={handoverRecords} incidents={incidents} shipments={shipments} activeLocationId={activeLocationId} brokenSeals={brokenSeals}
           />
         )}
         {view === "checkin" && (
@@ -1803,7 +1814,7 @@ function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
   ].filter((i) => i.roles.includes(role) && i.show !== false && (locationId !== SEAL_LOCATION_ID || LOADING_VIEWS.includes(i.id)) && (locationId !== ALL_LOC || ALL_VIEWS.includes(i.id)));
 
   return (
-    <nav className="no-print" style={vw >= 640 ? { position: "fixed", top: 0, bottom: 0, left: 0, width: vw >= 1024 ? 220 : 76, background: C.slate, display: "flex", flexDirection: "column", overflowY: "auto", zIndex: 45 } : {
+    <nav className="no-print" style={vw >= 640 ? { position: "fixed", top: 0, bottom: 0, left: 0, width: vw >= 1024 ? 220 : 76, background: "#0B1F3A", display: "flex", flexDirection: "column", overflowY: "auto", zIndex: 45 } : {
       position: "fixed", bottom: 0, left: 0, right: 0, background: "#fff", borderTop: `1px solid ${C.line}`,
       display: "flex", overflowX: "auto", zIndex: 40, boxShadow: "0 -4px 14px rgba(15,23,42,0.08)",
     }}>
@@ -2050,7 +2061,7 @@ function LoginScreen({ authError, onClearAuthError, notify }) {
 /* ---------------------------------------------------------------------
    DASHBOARD
 --------------------------------------------------------------------- */
-function Dashboard({ session, employees, attendance, settings, empById, today, goto, sendReport, leaves, stockItems, stockMovements, visitors, handoverRecords, incidents, shipments }) {
+function Dashboard({ session, employees, attendance, settings, empById, today, goto, sendReport, leaves, stockItems, stockMovements, visitors, handoverRecords, incidents, shipments, activeLocationId, brokenSeals }) {
   const todays = attendance.filter((a) => a.date === today);
   const inside = todays.filter((a) => a.status === "INSIDE");
   const checkedOutToday = todays.filter((a) => a.status === "CHECKED_OUT");
@@ -2072,7 +2083,45 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
   const shipThreshold = settings.shipment_threshold_days || 3;
   const shipmentsInWh = (shipments || []).filter((x) => x.status === "IN_WAREHOUSE");
   const overdueShipments = shipmentsInWh.filter((x) => shipmentState(x, shipThreshold) === "OVERDUE");
-  const damagedShipments = (shipments || []).filter((x) => x.damaged && x.status === "IN_WAREHOUSE");
+  const isAll = activeLocationId === ALL_LOC;
+  const locLabel = isAll ? "" : (activeLocationId || "");
+  const nav = (v) => (isAll ? undefined : () => goto(v));
+  const go = (key, val, alertF, view) => () => { if (isAll) { window.__alertFilter = alertF; goto("alerts"); } else { window[key] = val; goto(view); } };
+  const openInc = (incidents || []).filter((i) => i.status === "Open" || i.status === "Under Investigation");
+  const critInc = openInc.filter((i) => i.severity === "Critical");
+  const highInc = openInc.filter((i) => i.severity === "High");
+  const damagedShip = (shipments || []).filter((x) => x.damaged && x.status === "IN_WAREHOUSE");
+  const discRecs = (handoverRecords || []).filter((r) => r.has_discrepancy === true && r.status !== "CANCELLED");
+  const seals30 = (brokenSeals || []).filter((x) => (Number(x.created_at) || 0) >= Date.now() - 30 * 86400000);
+  const sealApplicable = isAll ? (Array.isArray(session.locationIds) && session.locationIds.includes(SEAL_LOCATION_ID)) : activeLocationId === SEAL_LOCATION_ID;
+  const hoHours = (settings.alerts && settings.alerts.pending_overdue_hours) || 2;
+  const overdueHo = (handoverRecords || []).filter((r) => r.status === "PENDING" && Date.now() - (Number(r.created_at) || 0) > hoHours * 3600000);
+  const opsCards = [
+    { label: "Critical Incidents", value: critInc.length, icon: AlertTriangle, from: "#B91C1C", to: "#EF4444", onClick: go("__incFilter", "Critical", { cat: "incident", sev: "CRITICAL" }, "incidents") },
+    { label: "High Priority Incidents", value: highInc.length, icon: AlertTriangle, from: "#C2410C", to: "#F97316", onClick: go("__incFilter", "High", { cat: "incident", sev: "HIGH" }, "incidents") },
+    { label: "Open Incidents", value: openInc.length, icon: ClipboardList, from: "#1D4ED8", to: "#3B82F6", onClick: go("__incFilter", "", { cat: "incident" }, "incidents") },
+    { label: "Damaged Shipments", value: damagedShip.length, icon: Package, from: "#9F1239", to: "#E11D48", sub: "in warehouse", onClick: go("__shipIntent", { damaged: true, day: "all", mode: "remaining" }, { cat: "shipment" }, "shipments") },
+    { label: "Missing Items / Discrepancies", value: discRecs.length, icon: RefreshCw, from: "#7C2D12", to: "#EA580C", sub: "flagged handovers", onClick: go("__hoIntent", "history", { cat: "discrepancy" }, "handover") },
+    { label: "Broken Seals", value: sealApplicable ? seals30.length : "—", icon: ShieldCheck, from: "#4C1D95", to: "#7C3AED", sub: sealApplicable ? "last 30 days" : "Loading Area only", onClick: isAll ? (sealApplicable ? () => { window.__alertFilter = { cat: "seal" }; goto("alerts"); } : undefined) : (sealApplicable ? () => goto("sealreg") : undefined) },
+    { label: "Overdue Handovers", value: overdueHo.length, icon: Clock, from: "#0F766E", to: "#14B8A6", sub: `over ${hoHours}h pending`, onClick: go("__hoIntent", "current", { cat: "pending", status: "OVERDUE" }, "handover") },
+    { label: "Overdue Shipments", value: overdueShipments.length, icon: Truck, from: "#334155", to: "#64748B", sub: isAll ? "select a location to open" : "", onClick: isAll ? undefined : go("__shipIntent", { day: "all", mode: "remaining" }, null, "shipments") },
+  ];
+  const locOf = (r) => r._loc || locLabel;
+  const recent = [
+    ...(incidents || []).map((r) => ({ t: Number(r.created_at) || 0, cat: "Incident", icon: AlertTriangle, text: `${r.severity} — ${r.type}`, status: r.status, loc: locOf(r), hot: r.severity === "Critical" || r.severity === "High" })),
+    ...(shipments || []).filter((r) => r.damaged).map((r) => ({ t: Number(r.created_at) || 0, cat: "Damaged shipment", icon: Package, text: `${shipRef(r)} — ${r.damage_notes || "damage reported"}`, status: r.status === "IN_WAREHOUSE" ? "In warehouse" : "Released", loc: locOf(r), hot: true })),
+    ...discRecs.map((r) => ({ t: Number(r.created_at) || 0, cat: "Handover discrepancy", icon: RefreshCw, text: `${r.discrepancy_count || ""} item(s) missing or short — ${r.outgoing_guard || ""}`, status: r.status === "PENDING" ? "Pending" : "Completed", loc: locOf(r), hot: false })),
+    ...seals30.map((r) => ({ t: Number(r.created_at) || 0, cat: "Broken seal", icon: ShieldCheck, text: `Seal ${r.seal_number}${r.driver_name ? " — " + r.driver_name : ""}`, status: "Broken", loc: SEAL_LOCATION_ID, hot: true })),
+    ...todays.map((a) => { const e = empById[a.employee_id]; return e ? { t: Number(a.updated_at || a.created_at) || 0, cat: "Attendance", icon: Users, text: `${e.name} ${a.status === "INSIDE" ? "checked in" : "checked out"}`, status: a.status === "INSIDE" ? "Inside" : "Out", loc: locOf(e), hot: false } : null; }).filter(Boolean),
+  ].filter((x) => x.t).sort((a, b) => b.t - a.t).slice(0, 8);
+  const canOps = ["admin", "supervisor", "guard"].includes(session.role);
+  const canSeeEmployees = ["admin", "supervisor", "manager", "security_manager"].includes(session.role);
+  const donutParts = [
+    { label: "Checked in", value: checkedInIds.size, color: "#3B82F6" },
+    { label: "On leave", value: onLeaveToday.length, color: "#22C55E" },
+    { label: "Not checked in", value: notCheckedIn.length, color: "#F59E0B" },
+  ];
+
 
   const channels = settings.report_channels || { attendance: defaultChannel(), security: defaultChannel(), inventory: defaultChannel(), shipments: defaultChannel() };
   const dueSections = session.role === "admin"
@@ -2193,23 +2242,70 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
         </div>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 22 }}>
-        <StatCard label="Total Employees" value={activeEmployees.length} icon={Users} tone="red" onClick={isMgmt(session) ? () => goto("employees") : undefined} />
-        <StatCard label="Checked In Today" value={todays.length} icon={CalendarDays} tone="teal" onClick={() => goto("attendance")} />
-        <StatCard label="Currently Inside" value={inside.length} icon={Clock} tone="amber" onClick={() => goto("attendance")} />
-        <StatCard label="Checked Out Today" value={checkedOutToday.length} icon={DoorClosed} tone="slate" onClick={() => goto("attendance")} />
-        <StatCard label="Not Checked In" value={notCheckedIn.length} icon={XCircle} tone="red" onClick={() => goto("attendance")} />
-        <StatCard label="On Leave Today" value={onLeaveToday.length} icon={UserX} tone="slate" onClick={() => goto("leave")} />
-        <StatCard label="In Overtime" value={overtimeToday.length} icon={AlertTriangle} tone="amber" onClick={() => goto("attendance")} />
-        <StatCard label="Visitors/Contractors Inside" value={visitorsInside.length} icon={UserPlus} tone="purple" onClick={() => goto("visitors")} />
-        <StatCard label="Low Stock Items" value={lowStockItems.length} icon={Package} tone="slate" onClick={() => goto("inventory")} />
-        <StatCard label="Shipments in Warehouse" value={shipmentsInWh.length} icon={Truck} tone="teal" onClick={() => goto("shipments")} />
-        <StatCard label="Overdue Shipments" value={overdueShipments.length} icon={Clock} tone={overdueShipments.length ? "red" : "slate"} onClick={() => goto("shipments")} />
-        <StatCard label="Damaged Shipments" value={damagedShipments.length} icon={AlertTriangle} tone={damagedShipments.length ? "red" : "slate"} onClick={() => goto("shipments")} />
-        <StatCard label="Open Incidents" value={openIncidents.length} icon={AlertTriangle} tone="red" onClick={() => goto("incidents")} />
+      <SectionTitle title="Security Operations Overview" sub={isAll ? "Consolidated across all your authorized locations" : locLabel} />
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 12, marginBottom: 22 }}>
+        {opsCards.map((k) => <KpiCard key={k.label} {...k} />)}
       </div>
 
-      <SectionTitle title="Currently Inside" sub={`${inside.length} on site`} />
+      <SectionTitle title="Attendance & Workforce" />
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12, marginBottom: 16 }}>
+        <StatCard label="Total Employees" value={activeEmployees.length} icon={Users} tone="red" onClick={canSeeEmployees ? () => goto("employees") : undefined} />
+        <StatCard label="Checked In Today" value={checkedInIds.size} icon={CalendarDays} tone="teal" onClick={() => goto("attendance")} />
+        <StatCard label="Currently Inside" value={inside.length} icon={Clock} tone="amber" onClick={() => goto("attendance")} />
+        <StatCard label="Not Checked In" value={notCheckedIn.length} icon={XCircle} tone="red" onClick={() => goto("attendance")} />
+        <StatCard label="On Leave Today" value={onLeaveToday.length} icon={UserX} tone="slate" onClick={nav("leave")} />
+        <StatCard label="In Overtime" value={overtimeToday.length} icon={AlertTriangle} tone="amber" onClick={() => goto("attendance")} />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(300px,1fr))", gap: 14, marginBottom: 22 }}>
+        <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 16, padding: 16, boxShadow: "0 1px 4px rgba(15,23,42,0.06)" }}>
+          <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 10 }}>Employee Overview</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap" }}>
+            <Donut parts={donutParts} total={activeEmployees.length} />
+            <div style={{ flex: 1, minWidth: 140 }}>
+              {donutParts.map((p) => (
+                <div key={p.label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, padding: "4px 0" }}>
+                  <span style={{ width: 10, height: 10, borderRadius: "50%", background: p.color }} />
+                  <span style={{ flex: 1 }}>{p.label}</span>
+                  <b>{p.value}</b><span style={{ color: C.ink50, width: 44, textAlign: "right" }}>{activeEmployees.length ? Math.round((p.value / activeEmployees.length) * 100) : 0}%</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 16, padding: 16, boxShadow: "0 1px 4px rgba(15,23,42,0.06)" }}>
+          <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 10 }}>Quick Actions</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            {!isAll && canOps && <Btn tone="paper" icon={DoorOpen} onClick={() => goto("checkin")}>Check In</Btn>}
+            {!isAll && canOps && <Btn tone="paper" icon={DoorClosed} onClick={() => goto("checkout")}>Check Out</Btn>}
+            {!isAll && canOps && <Btn tone="paper" icon={UserPlus} onClick={() => goto("visitors")}>Register Visitor</Btn>}
+            {canSeeEmployees && !isAll && <Btn tone="paper" icon={BarChart3} onClick={() => goto("reports")}>View Reports</Btn>}
+            {canSeeEmployees && <Btn tone="paper" icon={AlertTriangle} onClick={() => goto("alerts")}>All Alerts</Btn>}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12, marginBottom: 22 }}>
+        <StatCard label="Visitors / Contractors Inside" value={visitorsInside.length} icon={UserPlus} tone="purple" onClick={nav("visitors")} />
+        <StatCard label="Low Stock Items" value={lowStockItems.length} icon={Package} tone="slate" onClick={nav("inventory")} />
+        <StatCard label="Shipments in Warehouse" value={shipmentsInWh.length} icon={Truck} tone="teal" onClick={nav("shipments")} />
+      </div>
+
+      <SectionTitle title="Recent Activity" sub="Latest real records from your authorized locations" action={canSeeEmployees ? { label: "View all alerts", onClick: () => goto("alerts") } : undefined} />
+      <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 16, overflow: "hidden", marginBottom: 22 }}>
+        {recent.length === 0 ? <EmptyState icon={ClipboardList} title="No recent activity yet" /> : recent.map((r, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderBottom: i < recent.length - 1 ? `1px solid ${C.line}` : "none", background: r.hot ? "#FEF7F7" : "#fff" }}>
+            <div style={{ width: 34, height: 34, borderRadius: "50%", background: r.hot ? C.red : C.navy, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><r.icon size={16} color="#fff" /></div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13.5, fontWeight: r.hot ? 700 : 500, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.text}</div>
+              <div style={{ fontSize: 11.5, color: C.ink50 }}>{r.cat}{r.loc ? ` · ${r.loc}` : ""} · {r.status}</div>
+            </div>
+            <div style={{ fontSize: 11.5, color: C.ink50, flexShrink: 0, textAlign: "right" }}>{dubaiStamp(r.t)}</div>
+          </div>
+        ))}
+      </div>
+
+      
+<SectionTitle title="Currently Inside" sub={`${inside.length} on site`} />
       <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", marginBottom: 22 }}>
         {inside.length === 0 ? <EmptyState icon={DoorOpen} title="No one is currently inside" /> : (
           <TableScroll headers={["Employee", "ID", "Company", "Time In", "Duration"]}>
@@ -2260,6 +2356,41 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
         </div>
       </div>
     </div>
+  );
+}
+
+function KpiCard({ label, value, icon: Icon, from, to, onClick, sub }) {
+  const W = onClick ? "button" : "div";
+  return (
+    <W onClick={onClick} style={{ background: `linear-gradient(135deg, ${from}, ${to})`, color: "#fff", border: "none", borderRadius: 16, padding: "14px 16px", textAlign: "left", cursor: onClick ? "pointer" : "default", boxShadow: "0 4px 14px rgba(15,23,42,0.18)", display: "flex", alignItems: "center", gap: 12, minHeight: 92, fontFamily: FONT_SANS, width: "100%" }}>
+      <div style={{ width: 46, height: 46, borderRadius: 12, background: "rgba(255,255,255,0.2)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon size={24} color="#fff" /></div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, opacity: 0.92, lineHeight: 1.25 }}>{label}</div>
+        <div style={{ fontFamily: FONT_SERIF, fontSize: 30, fontWeight: 800, lineHeight: 1.1 }}>{value}</div>
+        {sub ? <div style={{ fontSize: 10.5, opacity: 0.85 }}>{sub}</div> : null}
+      </div>
+      {onClick ? <ChevronRight size={18} color="#fff" /> : null}
+    </W>
+  );
+}
+
+function Donut({ parts, total }) {
+  const r = 52, c = 2 * Math.PI * r;
+  let off = 0;
+  return (
+    <svg width="150" height="150" viewBox="0 0 140 140" role="img" aria-label="Employee overview">
+      <g transform="rotate(-90 70 70)">
+        <circle cx="70" cy="70" r={r} fill="none" stroke={C.line} strokeWidth="18" />
+        {total > 0 && parts.filter((p) => p.value > 0).map((p) => {
+          const len = (p.value / total) * c;
+          const el = <circle key={p.label} cx="70" cy="70" r={r} fill="none" stroke={p.color} strokeWidth="18" strokeDasharray={`${len} ${c - len}`} strokeDashoffset={-off} />;
+          off += len;
+          return el;
+        })}
+      </g>
+      <text x="70" y="68" textAnchor="middle" fontSize="26" fontWeight="800" fill={C.ink}>{total}</text>
+      <text x="70" y="86" textAnchor="middle" fontSize="11" fill={C.ink50}>Total</text>
+    </svg>
   );
 }
 
@@ -4172,7 +4303,8 @@ function StockMovementForm({ item, type, onClose, onSave, canBackdate }) {
    a manager rather than waiting for a scheduled report.
 --------------------------------------------------------------------- */
 function HandoverScreen({ session, users, roster, handoverItems, handoverRecords, persistHandoverItems, persistHandoverRecords, settings, persistSettings, notify }) {
-  const [tab, setTab] = useState("current");
+  const hoTab = useRef((() => { const v = window.__hoIntent; window.__hoIntent = undefined; return v || "current"; })()).current;
+  const [tab, setTab] = useState(hoTab);
   const [showStart, setShowStart] = useState(false);
   const [takingOver, setTakingOver] = useState(null);
   const [managingItems, setManagingItems] = useState(false);
@@ -4494,6 +4626,8 @@ function severityTone(sev) {
 }
 
 function IncidentsScreen({ session, incidents, persistIncidents, settings, persistSettings, notify }) {
+  const sevIntent = useRef((() => { const v = window.__incFilter; window.__incFilter = undefined; return v || ""; })()).current;
+  const [sevFilter, setSevFilter] = useState(sevIntent);
   const [tab, setTab] = useState("open");
   const [showForm, setShowForm] = useState(false);
   const [viewing, setViewing] = useState(null);
@@ -4501,7 +4635,7 @@ function IncidentsScreen({ session, incidents, persistIncidents, settings, persi
 
   const sorted = useMemo(() => [...incidents].sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)), [incidents]);
   const open = sorted.filter((i) => i.status === "Open" || i.status === "Under Investigation");
-  const list = tab === "open" ? open : sorted;
+  const list = (tab === "open" ? open : sorted).filter((i) => !sevFilter || i.severity === sevFilter);
 
   const report = async (data) => {
     const now = new Date();
@@ -4562,6 +4696,7 @@ function IncidentsScreen({ session, incidents, persistIncidents, settings, persi
         ))}
       </div>
 
+      {sevFilter && <div style={{ marginBottom: 10 }}><Badge tone="missing">SHOWING {sevFilter.toUpperCase()} ONLY</Badge> <button onClick={() => setSevFilter("")} style={{ background: "none", border: "none", color: C.navy, fontSize: 12, fontWeight: 600, cursor: "pointer", textDecoration: "underline" }}>Show all</button></div>}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {list.length === 0 ? <EmptyState icon={AlertTriangle} title={tab === "open" ? "No open incidents" : "No incidents reported yet"} /> : (
           list.map((i) => (
@@ -4805,11 +4940,12 @@ function OriginField({ value, onChange, custom }) {
 }
 
 function ShipmentsScreen({ session, shipments, persistShipments, settings, persistSettings, notify, sendReport, getDb, firebaseMode, activeLocationId }) {
+  const shipIntent = useRef((() => { const v = window.__shipIntent; window.__shipIntent = undefined; return v || {}; })()).current;
   const threshold = settings.shipment_threshold_days || 3;
   const custom = settings.origin_custom || {};
   const keys = dayKeys();
-  const [day, setDay] = useState("today");
-  const [mode, setMode] = useState("arrived");
+  const [day, setDay] = useState(shipIntent.day || "today");
+  const [mode, setMode] = useState(shipIntent.mode || "arrived");
   const [q, setQ] = useState("");
   const [showReceive, setShowReceive] = useState(false);
   const [showScan, setShowScan] = useState(false);
@@ -4820,7 +4956,7 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
   const [showCount, setShowCount] = useState(null); // "IN" | "OUT" | null
   const [damageFor, setDamageFor] = useState(null);
   const [photosOf, setPhotosOf] = useState(null);
-  const [onlyDamaged, setOnlyDamaged] = useState(false);
+  const [onlyDamaged, setOnlyDamaged] = useState(!!shipIntent.damaged);
 
   const inWh = useMemo(() => shipments.filter((s) => s.status === "IN_WAREHOUSE").sort((a, b) => (a.date_in + a.time_in).localeCompare(b.date_in + b.time_in)), [shipments]);
   const overdue = inWh.filter((s) => shipmentState(s, threshold) === "OVERDUE");
@@ -6626,7 +6762,7 @@ function AlertsScreen({ session, getDb, notify, openSource }) {
   const [openSites, setOpenSites] = useState({});
   const [detail, setDetail] = useState(null);
   const [startDate, setStartDate] = useState("");
-  const [f, setF] = useState({ view: "open", loc: "", cat: "", sev: "", status: "", q: "", from: "", to: "" });
+  const [f, setF] = useState(() => { const v = window.__alertFilter; window.__alertFilter = undefined; return { view: "open", loc: "", cat: "", sev: "", status: "", q: "", from: "", to: "", ...(v || {}) }; });
   const set = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.value }));
 
   useEffect(() => { const t = setInterval(() => setClock((c) => c + 1), 60000); return () => clearInterval(t); }, []);
