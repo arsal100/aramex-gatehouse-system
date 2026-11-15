@@ -1,15 +1,25 @@
-
 /*
  * Service Worker — Aramex Gate House Register
  * GitHub Pages: /aramex-gatehouse-system/
  *
  * IMPORTANT:
  * Whenever you publish a new app version, change CACHE_NAME.
- * Example: aramex-gatehouse-v1 -> aramex-gatehouse-v2
+ * Example: aramex-gatehouse-v2 -> aramex-gatehouse-v3
+ *
+ * Changes in v2:
+ *  - The scripts the app needs (React, Babel, Firebase SDK) are now cached, so the
+ *    installed app can open without internet. They come from a CDN and were
+ *    previously never cached.
+ *  - Version-pinned CDN files are served cache-first (they never change).
+ *  - Page loads wait at most 4 seconds for the network, then use the saved copy,
+ *    so a weak connection no longer freezes the app.
+ *
+ * If you change a CDN version in index.html, change it in CDN_SHELL below too.
  */
 
 const APP_ROOT = '/aramex-gatehouse-system/';
-const CACHE_NAME = 'aramex-gatehouse-v1';
+const CACHE_NAME = 'aramex-gatehouse-v2';
+const NETWORK_TIMEOUT_MS = 4000;
 
 // Main application files to cache for offline access.
 const APP_SHELL = [
@@ -20,7 +30,35 @@ const APP_SHELL = [
   `${APP_ROOT}icon-512.png`
 ];
 
-// INSTALL: Cache the application shell.
+// Version-pinned scripts loaded by index.html (must match the exact URLs there).
+const CDN_SHELL = [
+  'https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js',
+  'https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js',
+  'https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.4/babel.min.js',
+  'https://cdn.jsdelivr.net/npm/firebase@10.14.1/firebase-app-compat.js',
+  'https://cdn.jsdelivr.net/npm/firebase@10.14.1/firebase-auth-compat.js',
+  'https://cdn.jsdelivr.net/npm/firebase@10.14.1/firebase-firestore-compat.js'
+];
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); }
+    );
+  });
+}
+
+// Only exact-version CDN files (for example react@18.3.1) are safe to keep forever.
+function isPinnedCdn(url) {
+  return (
+    url.hostname === 'cdn.jsdelivr.net' &&
+    /@v?\d+\.\d+\.\d+/.test(url.pathname)
+  );
+}
+
+// INSTALL: Cache the application shell and the pinned scripts.
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_NAME);
@@ -39,6 +77,27 @@ self.addEventListener('install', (event) => {
           console.warn(
             '[Aramex SW] Could not cache:',
             path,
+            error
+          );
+        }
+      })
+    );
+
+    await Promise.all(
+      CDN_SHELL.map(async (href) => {
+        try {
+          const response = await fetch(href, {
+            mode: 'cors',
+            credentials: 'omit'
+          });
+
+          if (response.ok) {
+            await cache.put(href, response);
+          }
+        } catch (error) {
+          console.warn(
+            '[Aramex SW] Could not cache script:',
+            href,
             error
           );
         }
@@ -92,6 +151,25 @@ function isStaticAsset(request, url) {
   );
 }
 
+// Pinned CDN files: saved copy first, otherwise download and save.
+async function cdnCacheFirst(url) {
+  const cache = await caches.open(CACHE_NAME);
+  const hit = await cache.match(url.href);
+
+  if (hit) return hit;
+
+  const response = await fetch(url.href, {
+    mode: 'cors',
+    credentials: 'omit'
+  });
+
+  if (response.ok) {
+    await cache.put(url.href, response.clone());
+  }
+
+  return response;
+}
+
 // FETCH: Network-first for HTML, cache-first for static assets.
 self.addEventListener('fetch', (event) => {
   const request = event.request;
@@ -101,17 +179,29 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url);
 
+  // Version-pinned CDN scripts (checked before the Firebase bypass, because
+  // the Firebase SDK files also come from the CDN).
+  if (isPinnedCdn(url)) {
+    event.respondWith(cdnCacheFirst(url));
+    return;
+  }
+
   // Leave Firebase, APIs and external resources untouched.
   if (shouldBypass(url)) return;
 
-  // HTML navigation: NETWORK FIRST.
+  // HTML navigation: NETWORK FIRST (with a timeout).
   if (
     request.mode === 'navigate' ||
     request.destination === 'document'
   ) {
     event.respondWith((async () => {
+      const networkPromise = fetch(request);
+
       try {
-        const response = await fetch(request);
+        const response = await withTimeout(
+          networkPromise,
+          NETWORK_TIMEOUT_MS
+        );
 
         if (response.ok) {
           const cache = await caches.open(CACHE_NAME);
@@ -125,12 +215,19 @@ self.addEventListener('fetch', (event) => {
         return response;
 
       } catch (error) {
-        // Use cached application when offline.
-        return (
+        // Slow or offline: use the saved application.
+        const cached =
           await caches.match(request) ||
           await caches.match(`${APP_ROOT}index.html`) ||
-          await caches.match(APP_ROOT) ||
-          new Response(
+          await caches.match(APP_ROOT);
+
+        if (cached) return cached;
+
+        // Nothing saved yet: keep waiting for the network.
+        try {
+          return await networkPromise;
+        } catch (networkError) {
+          return new Response(
             'You are offline. Aramex Gate House Register is unavailable.',
             {
               status: 503,
@@ -138,8 +235,8 @@ self.addEventListener('fetch', (event) => {
                 'Content-Type': 'text/plain'
               }
             }
-          )
-        );
+          );
+        }
       }
     })());
 
