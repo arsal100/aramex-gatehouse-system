@@ -141,6 +141,8 @@ const FONT_MONO = "'JetBrains Mono', 'SF Mono', Consolas, monospace";
 const isViewer = (x) => !!x && (x.role === "manager" || x.role === "security_manager");
 const isMgmt = (x) => !!x && (x.role === "admin" || x.role === "supervisor");
 const LOADING_VIEWS = ["dashboard", "alerts", "visitors", "handover", "incidents", "sealreg", "settings"];
+const ALL_LOC = "__ALL__";
+const ALL_VIEWS = ["dashboard", "alerts", "attendance", "employees"];
 const uid = (p = "") => p + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 
 async function sha256(text) {
@@ -1222,6 +1224,7 @@ function App() {
   // error is re-thrown so callers do not report success.
   const saveRecords = async (name, storageKey, setter, ref, next) => {
     const prev = ref.current;
+    if (activeLocationIdRef.current === ALL_LOC) { const m = "Choose a single location to make changes."; notify(m, "error"); throw new Error(m); }
     if (session && isViewer(session)) { const m = "Read-only access: managers cannot change records."; notify(m, "error"); throw new Error(m); }
     setter(next);
     const db = dbApiRef.current;
@@ -1276,6 +1279,7 @@ function App() {
     },
     settings: async (next) => {
       const prevSettings = settings;
+      if (activeLocationIdRef.current === ALL_LOC) { const m = "Choose a single location to change settings."; notify(m, "error"); throw new Error(m); }
       if (session && isViewer(session)) { const m = "Read-only access: managers cannot change settings."; notify(m, "error"); throw new Error(m); }
       setSettings(next);
       const db = dbApiRef.current;
@@ -1321,12 +1325,13 @@ function App() {
     const ids = Array.isArray(session.locationIds) ? session.locationIds : [];
     let saved = null;
     try { saved = localStorage.getItem(ACTIVE_LOCATION_KEY); } catch (e) { saved = null; }
-    setActiveLocationId(saved && ids.includes(saved) ? saved : (ids[0] || null));
+    setActiveLocationId(saved && (ids.includes(saved) || (saved === ALL_LOC && session.role !== "guard" && ids.length > 1)) ? saved : (ids[0] || null));
   }, [session]);
 
   const openSource = (loc, v) => { changeLocation(loc); setView(v); };
   const changeLocation = (locationId) => {
     if (locationId === SEAL_LOCATION_ID && !LOADING_VIEWS.includes(view)) setView("dashboard");
+    if (locationId === ALL_LOC && !ALL_VIEWS.includes(view)) setView("dashboard");
     setActiveLocationId(locationId);
     try { localStorage.setItem(ACTIVE_LOCATION_KEY, locationId); } catch (e) { /* ignore */ }
   };
@@ -1363,7 +1368,7 @@ function App() {
   useEffect(() => {
     const db = dbApiRef.current;
 
-    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId) {
+    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId || activeLocationId === ALL_LOC) {
       setRoster([]);
       return undefined;
     }
@@ -1395,7 +1400,7 @@ function App() {
   useEffect(() => {
     const db = dbApiRef.current;
 
-    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId) {
+    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId || activeLocationId === ALL_LOC) {
       return undefined;
     }
 
@@ -1450,6 +1455,51 @@ function App() {
         try { unsubscribe(); } catch (e) { /* ignore */ }
       });
     };
+  }, [session, activeLocationId]);
+
+  // ALL LOCATIONS (read-only overview): lighter queries per location, merged into the same lists the dashboard already uses.
+  useEffect(() => {
+    const db = dbApiRef.current;
+    if (dbModeRef.current !== "firebase" || !db || !session || activeLocationId !== ALL_LOC) return undefined;
+    let off = false, timer = null;
+    const ids = Array.isArray(session.locationIds) ? session.locationIds : [];
+    const day = todayStr();
+    const store = {};
+    const stops = [];
+    setDataError("");
+    setEmployees([]); setAttendance([]); setAudit([]); setLeaves([]); setVisitors([]); setStockItems([]);
+    setStockMovements([]); setHandoverItems([]); setHandoverRecords([]); setIncidents([]); setShipments([]); setSettings(defaultSettings());
+    const flush = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (off) return;
+        const cat = (key, fn) => ids.flatMap((l) => (store[l + "|" + key] || []).map((r) => (fn ? fn(r, l) : { ...r, _loc: l })));
+        const dedupe = (arr) => Array.from(new Map(arr.map((r) => [r.id, r])).values());
+        setEmployees(cat("employees", (r, l) => ({ ...r, name: `${r.name} · ${l}`, _loc: l })));
+        setAttendance(dedupe([...cat("attToday"), ...cat("attInside")]));
+        setLeaves(cat("leaves")); setVisitors(cat("visitors")); setStockItems(cat("stockItems")); setStockMovements(cat("stockMovements"));
+        setHandoverRecords(cat("pending")); setIncidents(cat("incidents")); setShipments(dedupe([...cat("shipWh"), ...cat("shipDmg")]));
+      }, 60);
+    };
+    const sub = (loc, key, q) => stops.push(q.onSnapshot(
+      (snap) => { store[loc + "|" + key] = snap.docs.map((d) => ({ ...d.data(), id: d.id })); flush(); },
+      (err) => { if (!off) setDataError(describeFirestoreError(err, `read ${key} for ${loc}`)); }
+    ));
+    ids.forEach((loc) => {
+      const c = (n) => db.collection(`locations/${loc}/${n}`);
+      sub(loc, "employees", c("employees"));
+      sub(loc, "attToday", c("attendance").where("date", "==", day));
+      sub(loc, "attInside", c("attendance").where("status", "==", "INSIDE"));
+      sub(loc, "leaves", c("leaves"));
+      sub(loc, "visitors", c("visitors").where("status", "==", "INSIDE"));
+      sub(loc, "stockItems", c("stockItems"));
+      sub(loc, "stockMovements", c("stockMovements"));
+      sub(loc, "pending", c("handoverRecords").where("status", "==", "PENDING"));
+      sub(loc, "incidents", c("incidents").where("status", "in", ["Open", "Under Investigation"]));
+      sub(loc, "shipWh", c("shipments").where("status", "==", "IN_WAREHOUSE"));
+      sub(loc, "shipDmg", c("shipments").where("damaged", "==", true));
+    });
+    return () => { off = true; clearTimeout(timer); stops.forEach((x) => { try { x(); } catch (e) { /* ignore */ } }); };
   }, [session, activeLocationId]);
 
   // LOCATION ACCESS HELPERS
@@ -1620,7 +1670,7 @@ function getLocationCollection(db, locationId, collectionName) {
           <AlertsScreen session={session} getDb={() => dbApiRef.current} notify={notify} openSource={openSource} />
         )}
         {view === "employees" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
-          <EmployeesScreen employees={employees} persistEmployees={persist.employees} notify={notify} canEdit={session.role === "admin"} />
+          <EmployeesScreen employees={employees} persistEmployees={persist.employees} notify={notify} canEdit={session.role === "admin" && activeLocationId !== ALL_LOC} />
         )}
         {view === "reports" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
           <ReportsScreen employees={employees} attendance={attendance} empById={empById} settings={settings} />
@@ -1704,6 +1754,7 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
                   aria-label="Location"
                   style={{ fontFamily: FONT_MONO, fontSize: 11, padding: "3px 6px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.4)", background: "rgba(255,255,255,0.16)", color: "#fff" }}
                 >
+                  {session.role !== "guard" && <option value="__ALL__" style={{ color: "#111" }}>All locations</option>}
                   {session.locationIds.map((id) => (
                     <option key={id} value={id} style={{ color: "#111" }}>{id}</option>
                   ))}
@@ -1749,7 +1800,7 @@ function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
     { id: "employees", label: "Employees", icon: Users, roles: ["admin","supervisor","manager","security_manager"] },
     { id: "reports", label: "Reports", icon: BarChart3, roles: ["admin","supervisor","manager","security_manager"] },
     { id: "settings", label: "Settings", icon: SettingsIcon, roles: ["admin"] },
-  ].filter((i) => i.roles.includes(role) && i.show !== false && (locationId !== SEAL_LOCATION_ID || LOADING_VIEWS.includes(i.id)));
+  ].filter((i) => i.roles.includes(role) && i.show !== false && (locationId !== SEAL_LOCATION_ID || LOADING_VIEWS.includes(i.id)) && (locationId !== ALL_LOC || ALL_VIEWS.includes(i.id)));
 
   return (
     <nav className="no-print" style={vw >= 640 ? { position: "fixed", top: 0, bottom: 0, left: 0, width: vw >= 1024 ? 220 : 76, background: C.slate, display: "flex", flexDirection: "column", overflowY: "auto", zIndex: 45 } : {
@@ -2021,6 +2072,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
   const shipThreshold = settings.shipment_threshold_days || 3;
   const shipmentsInWh = (shipments || []).filter((x) => x.status === "IN_WAREHOUSE");
   const overdueShipments = shipmentsInWh.filter((x) => shipmentState(x, shipThreshold) === "OVERDUE");
+  const damagedShipments = (shipments || []).filter((x) => x.damaged && x.status === "IN_WAREHOUSE");
 
   const channels = settings.report_channels || { attendance: defaultChannel(), security: defaultChannel(), inventory: defaultChannel(), shipments: defaultChannel() };
   const dueSections = session.role === "admin"
@@ -2153,6 +2205,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
         <StatCard label="Low Stock Items" value={lowStockItems.length} icon={Package} tone="slate" onClick={() => goto("inventory")} />
         <StatCard label="Shipments in Warehouse" value={shipmentsInWh.length} icon={Truck} tone="teal" onClick={() => goto("shipments")} />
         <StatCard label="Overdue Shipments" value={overdueShipments.length} icon={Clock} tone={overdueShipments.length ? "red" : "slate"} onClick={() => goto("shipments")} />
+        <StatCard label="Damaged Shipments" value={damagedShipments.length} icon={AlertTriangle} tone={damagedShipments.length ? "red" : "slate"} onClick={() => goto("shipments")} />
         <StatCard label="Open Incidents" value={openIncidents.length} icon={AlertTriangle} tone="red" onClick={() => goto("incidents")} />
       </div>
 
