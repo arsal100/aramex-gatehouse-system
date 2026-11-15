@@ -115,6 +115,7 @@ const FONT_MONO = "'JetBrains Mono', 'SF Mono', Consolas, monospace";
 /* ---------------------------------------------------------------------
    PURE HELPERS
 --------------------------------------------------------------------- */
+const isViewer = (x) => !!x && (x.role === "manager" || x.role === "security_manager");
 const isMgmt = (x) => !!x && (x.role === "admin" || x.role === "supervisor");
 const LOADING_VIEWS = ["dashboard", "visitors", "handover", "incidents", "sealreg", "settings"];
 const uid = (p = "") => p + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
@@ -734,7 +735,7 @@ async function loadStaffProfile(db, firebaseUser) {
     throw new Error("Your staff profile is incomplete: the role is missing. Contact the administrator.");
   }
 
-  if (!["admin","supervisor","manager","guard"].includes(profile.role.trim())) throw new Error("Your staff profile has an unrecognised role. Contact the administrator.");
+  if (!["admin","supervisor","manager","security_manager","guard"].includes(profile.role.trim())) throw new Error("Your staff profile has an unrecognised role. Contact the administrator.");
   const locationIds = Array.isArray(profile.locationIds)
     ? profile.locationIds.filter((id) => typeof id === "string" && id.trim() !== "")
     : [];
@@ -1198,7 +1199,7 @@ function App() {
   // error is re-thrown so callers do not report success.
   const saveRecords = async (name, storageKey, setter, ref, next) => {
     const prev = ref.current;
-    if (session && session.role === "manager") { const m = "Read-only access: managers cannot change records."; notify(m, "error"); throw new Error(m); }
+    if (session && isViewer(session)) { const m = "Read-only access: managers cannot change records."; notify(m, "error"); throw new Error(m); }
     setter(next);
     const db = dbApiRef.current;
 
@@ -1252,7 +1253,7 @@ function App() {
     },
     settings: async (next) => {
       const prevSettings = settings;
-      if (session && session.role === "manager") { const m = "Read-only access: managers cannot change settings."; notify(m, "error"); throw new Error(m); }
+      if (session && isViewer(session)) { const m = "Read-only access: managers cannot change settings."; notify(m, "error"); throw new Error(m); }
       setSettings(next);
       const db = dbApiRef.current;
 
@@ -1301,6 +1302,7 @@ function App() {
   }, [session]);
 
   const changeLocation = (locationId) => {
+    if (locationId === SEAL_LOCATION_ID && !LOADING_VIEWS.includes(view)) setView("dashboard");
     setActiveLocationId(locationId);
     try { localStorage.setItem(ACTIVE_LOCATION_KEY, locationId); } catch (e) { /* ignore */ }
   };
@@ -1470,7 +1472,7 @@ function getLocationCollection(db, locationId, collectionName) {
     a.href = mailto; a.target = "_blank";
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     // "last sent" is stored in the settings, which only admins may change; for everyone else just skip it.
-    if (session && isMgmt(session)) {
+    if (session && session.role === "admin") {
       try {
         await persist.settings({ ...settings, report_channels: { ...channels, [section]: { ...ch, last_sent: todayStr() } } });
       } catch (e) { /* the failed save already showed an error */ }
@@ -1590,10 +1592,10 @@ function getLocationCollection(db, locationId, collectionName) {
           <IncidentsScreen session={session} incidents={incidents} persistIncidents={persist.incidents}
             settings={settings} persistSettings={persist.settings} notify={notify} />
         )}
-        {view === "employees" && ["admin","supervisor","manager"].includes(session.role) && (
-          <EmployeesScreen employees={employees} persistEmployees={persist.employees} notify={notify} />
+        {view === "employees" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
+          <EmployeesScreen employees={employees} persistEmployees={persist.employees} notify={notify} canEdit={session.role === "admin"} />
         )}
-        {view === "reports" && ["admin","supervisor","manager"].includes(session.role) && (
+        {view === "reports" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
           <ReportsScreen employees={employees} attendance={attendance} empById={empById} settings={settings} />
         )}
         {view === "settings" && session.role === "admin" && (
@@ -1704,20 +1706,20 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
 
 function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
   const items = [
-    { id: "dashboard", label: "Dashboard", icon: Home, roles: ["admin","supervisor","manager","guard"] },
+    { id: "dashboard", label: "Dashboard", icon: Home, roles: ["admin","supervisor","manager","security_manager","guard"] },
     { id: "checkin", label: "Check In", icon: DoorOpen, roles: ["admin","supervisor","guard"] },
     { id: "checkout", label: "Check Out", icon: DoorClosed, roles: ["admin","supervisor","guard"] },
-    { id: "attendance", label: "Today", icon: ClipboardList, roles: ["admin","supervisor","manager","guard"] },
-    { id: "history", label: "History", icon: CalendarDays, roles: ["admin","supervisor","manager","guard"] },
-    { id: "leave", label: "Leave", icon: UserX, roles: ["admin","supervisor","manager","guard"] },
-    { id: "visitors", label: "Visitors", icon: UserPlus, roles: ["admin","supervisor","manager","guard"] },
-    { id: "inventory", label: "Inventory", icon: Package, roles: ["admin","supervisor","manager","guard"] },
-    { id: "shipments", label: "Shipments", icon: Truck, roles: ["admin","supervisor","manager","guard"] },
-    { id: "sealreg", label: "Seal Register", icon: ShieldCheck, roles: ["admin","supervisor","manager","guard"], show: !!canSealRegister },
-    { id: "handover", label: "Handover", icon: RefreshCw, roles: ["admin","supervisor","manager","guard"] },
-    { id: "incidents", label: "Incidents", icon: AlertTriangle, roles: ["admin","supervisor","manager","guard"] },
-    { id: "employees", label: "Employees", icon: Users, roles: ["admin","supervisor","manager"] },
-    { id: "reports", label: "Reports", icon: BarChart3, roles: ["admin","supervisor","manager"] },
+    { id: "attendance", label: "Today", icon: ClipboardList, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "history", label: "History", icon: CalendarDays, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "leave", label: "Leave", icon: UserX, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "visitors", label: "Visitors", icon: UserPlus, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "inventory", label: "Inventory", icon: Package, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "shipments", label: "Shipments", icon: Truck, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "sealreg", label: "Seal Register", icon: ShieldCheck, roles: ["admin","supervisor","manager","security_manager","guard"], show: !!canSealRegister },
+    { id: "handover", label: "Handover", icon: RefreshCw, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "incidents", label: "Incidents", icon: AlertTriangle, roles: ["admin","supervisor","manager","security_manager","guard"] },
+    { id: "employees", label: "Employees", icon: Users, roles: ["admin","supervisor","manager","security_manager"] },
+    { id: "reports", label: "Reports", icon: BarChart3, roles: ["admin","supervisor","manager","security_manager"] },
     { id: "settings", label: "Settings", icon: SettingsIcon, roles: ["admin"] },
   ].filter((i) => i.roles.includes(role) && i.show !== false && (locationId !== SEAL_LOCATION_ID || LOADING_VIEWS.includes(i.id)));
 
@@ -1993,7 +1995,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
   const overdueShipments = shipmentsInWh.filter((x) => shipmentState(x, shipThreshold) === "OVERDUE");
 
   const channels = settings.report_channels || { attendance: defaultChannel(), security: defaultChannel(), inventory: defaultChannel(), shipments: defaultChannel() };
-  const dueSections = isMgmt(session)
+  const dueSections = session.role === "admin"
     ? ["attendance", "security", "inventory", "shipments"].filter((s) => isReportDue(channels[s]))
     : [];
   const sectionLabel = { attendance: "Attendance", security: "Security", inventory: "Inventory", shipments: "Shipments" };
@@ -3075,7 +3077,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
   return (
     <div>
       <SectionTitle title="Inventory" sub={`${activeItems.length} item(s) tracked${lowStock.length ? ` · ${lowStock.length} low` : ""}`}
-        action={isMgmt(session) ? { label: "+ Add Item", onClick: () => setShowItemForm(true) } : undefined} />
+        action={session.role === "admin" ? { label: "+ Add Item", onClick: () => setShowItemForm(true) } : undefined} />
 
       {lowStock.length > 0 && (
         <div style={{ background: "#F7E7E5", border: `1px solid #E9C3BE`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
@@ -3117,7 +3119,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
                       <span style={{ fontFamily: FONT_MONO, color: C.ink, fontWeight: 600 }}>{i.level} {i.unit}</span> on hand · minimum {i.min_threshold} {i.unit}
                     </div>
                   </div>
-                  {isMgmt(session) && (
+                  {session.role === "admin" && (
                     <button onClick={() => setEditingItem(i)} style={{ background: "none", border: "none", color: C.navy, cursor: "pointer" }}><Edit3 size={15} /></button>
                   )}
                 </div>
@@ -3178,7 +3180,7 @@ const SEAL_CHAMBERS = ["DFC-101", "DFC-102", "DFC-107", "DFC-109"];
 
 function canUseSealRegister(session) {
   if (!session) return false;
-  if (isMgmt(session) || session.role === "manager") return true;
+  if (isMgmt(session) || isViewer(session)) return true;
   return Array.isArray(session.locationIds) && session.locationIds.includes(SEAL_LOCATION_ID);
 }
 
@@ -3229,7 +3231,7 @@ function extractSealCandidates(text) {
 // Reads text from the photo in the browser (Tesseract.js, loaded only when used).
 // Reuses the app's image preparation (upscale, grayscale, contrast) and runs two passes.
 async function readSealCandidates(file) {
-  await loadExternalScript("https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js", () => window.Tesseract);
+  await loadExternalScript("https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js", () => window.Tesseract);
   const run = (async () => {
     const blob = await prepareImageForOcr(file);
     const worker = await window.Tesseract.createWorker("eng");
@@ -3399,7 +3401,7 @@ function SealForm({ direction, onClose, onSave }) {
 }
 
 function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
-  const isAdmin = isMgmt(session);
+  const isAdmin = session.role === "admin";
   const hasAccess = firebaseMode && Array.isArray(session.locationIds) && session.locationIds.includes(SEAL_LOCATION_ID);
   const base = `locations/${SEAL_LOCATION_ID}`;
 
@@ -4105,7 +4107,7 @@ function HandoverScreen({ session, users, roster, handoverItems, handoverRecords
     const rec = {
       id: uid("ho_"), date: todayStr(now), time_out: nowTimeStr(now), time_in: null,
       outgoing_guard: session.name, outgoing_uid: session.id, incoming_uid: data.incoming_uid, incoming_guard_expected: data.incoming_guard_expected, incoming_guard_confirmed: null,
-      status: "PENDING", items: data.items, remarks_out: data.remarks, remarks_in: "",
+      status: "PENDING", items: data.items, has_discrepancy: missing.length > 0, discrepancy_count: missing.length, remarks_out: data.remarks, remarks_in: "",
       created_at: Date.now(), updated_at: Date.now(),
     };
     await persistHandoverRecords([rec, ...handoverRecords]);
@@ -4116,7 +4118,7 @@ function HandoverScreen({ session, users, roster, handoverItems, handoverRecords
 
   const completeTakeover = async (remarksIn, updatedItems) => {
     const now = new Date();
-    const updated = { ...pending, status: "COMPLETED", time_in: nowTimeStr(now), incoming_guard_confirmed: session.name, incoming_confirmed_uid: session.id, remarks_in: remarksIn, items: updatedItems, updated_at: Date.now() };
+    const updated = { ...pending, status: "COMPLETED", time_in: nowTimeStr(now), incoming_guard_confirmed: session.name, incoming_confirmed_uid: session.id, remarks_in: remarksIn, items: updatedItems, has_discrepancy: !!pending.has_discrepancy || (pending.items || []).some((it) => !handoverItemOk(it)) || updatedItems.some((it) => !handoverItemOk(it)), discrepancy_count: updatedItems.filter((it) => !handoverItemOk(it)).length, updated_at: Date.now() };
     await persistHandoverRecords(handoverRecords.map((r) => (r.id === pending.id ? updated : r)));
     setTakingOver(null);
     notify("Shift taken over");
@@ -4143,7 +4145,7 @@ function HandoverScreen({ session, users, roster, handoverItems, handoverRecords
   return (
     <div>
       <SectionTitle title="Shift Handover" sub={pending ? "A handover is waiting to be taken over" : "No handover currently pending"}
-        action={isMgmt(session) ? { label: "Manage Checklist", onClick: () => setManagingItems(true) } : undefined} />
+        action={session.role === "admin" ? { label: "Manage Checklist", onClick: () => setManagingItems(true) } : undefined} />
 
       <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
         {[["current", "Current"], ["history", "History"]].map(([k, label]) => (
@@ -4191,7 +4193,7 @@ function HandoverScreen({ session, users, roster, handoverItems, handoverRecords
             </div>
           )}
 
-          <Btn full tone="navy" icon={DoorOpen} onClick={() => setShowStart(true)} disabled={!!pending || session.role === "manager"}>
+          <Btn full tone="navy" icon={DoorOpen} onClick={() => setShowStart(true)} disabled={!!pending || isViewer(session)}>
             {pending ? "Complete the pending takeover first" : "+ Start Handover (End of My Shift)"}
           </Btn>
         </div>
@@ -4262,7 +4264,7 @@ function HandoverForm({ items, users, roster, session, onClose, onSave }) {
         <Field label="Incoming guard's name"><input style={inputStyle} value={otherName} onChange={(e) => setOtherName(e.target.value)} placeholder="Full name" autoFocus /></Field>
       )}
       {guardNames.length === 0 && (
-        <div style={{ fontSize: 12, color: C.ink50, marginBottom: 10, lineHeight: 1.5 }}>No other guards are listed yet — a guard appears here after their first login. Choose “Someone else” and type the name.</div>
+        <div style={{ fontSize: 12, color: C.ink50, marginBottom: 10, lineHeight: 1.5 }}>No other guards are listed yet — a guard appears here after their first login. Ask them to log in once so they appear here.</div>
       )}
       <div style={{ fontSize: 12.5, fontWeight: 600, color: C.ink50, margin: "6px 0" }}>CHECKLIST</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
@@ -4464,7 +4466,7 @@ function IncidentsScreen({ session, incidents, persistIncidents, settings, persi
   return (
     <div>
       <SectionTitle title="Incident Reports" sub={`${open.length} open`} action={{ label: "+ Report Incident", onClick: () => setShowForm(true) }} />
-      {isMgmt(session) && (
+      {session.role === "admin" && (
         <button onClick={() => setAlertSettings(true)} style={{ background: "none", border: "none", color: C.navy, fontSize: 12, fontWeight: 600, cursor: "pointer", textDecoration: "underline", marginBottom: 12, display: "block" }}>
           Alert Settings
         </button>
@@ -4928,7 +4930,7 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
       </div>
       <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         <span style={{ fontSize: 12.5, color: C.ink50 }}>Flag after <b style={{ color: C.ink }}>{threshold} day{threshold === 1 ? "" : "s"}</b> in warehouse</span>
-        {isMgmt(session) && (
+        {session.role === "admin" && (
           <>
             <button onClick={() => setShowThreshold(true)} style={{ background: "none", border: "none", color: C.navy, fontSize: 12, fontWeight: 600, cursor: "pointer", textDecoration: "underline", padding: 0 }}>Change</button>
             <button onClick={() => setShowCodes(true)} style={{ background: "none", border: "none", color: C.navy, fontSize: 12, fontWeight: 600, cursor: "pointer", textDecoration: "underline", padding: 0 }}>Origin codes</button>
@@ -5342,7 +5344,7 @@ function ManifestScanModal({ existing, custom, onClose, onSave, canBackdate }) {
         }
       } else {
         setProgress("Loading basic scanner…");
-        if (!window.Tesseract) await loadScriptOnce("https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js");
+        if (!window.Tesseract) await loadScriptOnce("https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js");
         const worker = await window.Tesseract.createWorker("eng");
         try {
           for (let i = 0; i < files.length; i++) {
@@ -5937,7 +5939,7 @@ function LeaveScreen({ session, employees, empById, leaves, persistLeaves, notif
             {range}{l.reason ? ` — ${l.reason}` : ""} · recorded by {l.recorded_by}
           </div>
         </div>
-        {removable && isMgmt(session) && (
+        {removable && session.role === "admin" && (
           <button onClick={() => setConfirmDelete(l)} style={{ background: "none", border: "none", color: C.redDeep, cursor: "pointer", flexShrink: 0 }}><Trash2 size={15} /></button>
         )}
       </div>
@@ -6025,7 +6027,7 @@ function LeaveForm({ employees, onClose, onSave }) {
 /* ---------------------------------------------------------------------
    EMPLOYEES (admin)
 --------------------------------------------------------------------- */
-function EmployeesScreen({ employees, persistEmployees, notify }) {
+function EmployeesScreen({ employees, persistEmployees, notify, canEdit }) {
   const [q, setQ] = useState("");
   const [statusFilter, setStatusFilter] = useState("active");
   const [editing, setEditing] = useState(null); // employee or {} for new
@@ -6073,10 +6075,10 @@ function EmployeesScreen({ employees, persistEmployees, notify }) {
   return (
     <div>
       <SectionTitle title="Employee Management" sub={`${employees.filter((e) => e.active).length} active · ${employees.filter((e) => !e.active).length} inactive`}
-        action={{ label: "+ Add employee", onClick: () => setEditing({}) }} />
+        action={canEdit ? { label: "+ Add employee", onClick: () => setEditing({}) } : undefined} />
 
       <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-        <Btn size="sm" tone="paper" icon={UserPlus} onClick={() => setBulkOpen(true)}>Bulk add employees</Btn>
+        {canEdit && <Btn size="sm" tone="paper" icon={UserPlus} onClick={() => setBulkOpen(true)}>Bulk add employees</Btn>}
         {demoCount > 0 && <Btn size="sm" tone="ghost" icon={Trash2} onClick={removeDemo}>Remove {demoCount} demo employee{demoCount === 1 ? "" : "s"}</Btn>}
       </div>
 
@@ -6104,7 +6106,7 @@ function EmployeesScreen({ employees, persistEmployees, notify }) {
                 <span style={{ fontFamily: FONT_MONO }}>{e.employee_number}</span> · {e.company} · {e.department} · {e.designation}
               </div>
             </div>
-            <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+            <div style={{ display: canEdit ? "flex" : "none", gap: 6, flexShrink: 0 }}>
               <button onClick={() => setEditing(e)} style={{ background: C.paperDim, border: "none", borderRadius: 7, padding: 8, cursor: "pointer", color: C.navy }}><Edit3 size={15} /></button>
               <button onClick={() => setConfirmDeactivate(e)} style={{ background: e.active ? "#F7E7E5" : "#EAF4EC", border: "none", borderRadius: 7, padding: 8, cursor: "pointer", color: e.active ? C.redDeep : C.greenDeep }}>
                 {e.active ? <Trash2 size={15} /> : <RefreshCw size={15} />}
