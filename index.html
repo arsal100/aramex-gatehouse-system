@@ -140,7 +140,7 @@ const FONT_MONO = "'JetBrains Mono', 'SF Mono', Consolas, monospace";
 --------------------------------------------------------------------- */
 const isViewer = (x) => !!x && (x.role === "manager" || x.role === "security_manager");
 const isMgmt = (x) => !!x && (x.role === "admin" || x.role === "supervisor");
-const LOADING_VIEWS = ["dashboard", "alerts", "visitors", "handover", "incidents", "sealreg", "settings"];
+const LOADING_VIEWS = ["dashboard", "alerts", "hse", "visitors", "handover", "incidents", "sealreg", "settings"];
 const ALL_LOC = "__ALL__";
 const ALL_VIEWS = ["dashboard", "alerts", "attendance", "employees"];
 const uid = (p = "") => p + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
@@ -760,7 +760,7 @@ async function loadStaffProfile(db, firebaseUser) {
     throw new Error("Your staff profile is incomplete: the role is missing. Contact the administrator.");
   }
 
-  if (!["admin","supervisor","manager","security_manager","guard"].includes(profile.role.trim())) throw new Error("Your staff profile has an unrecognised role. Contact the administrator.");
+  if (!["admin","supervisor","manager","security_manager","guard","hse_manager"].includes(profile.role.trim())) throw new Error("Your staff profile has an unrecognised role. Contact the administrator.");
   const locationIds = Array.isArray(profile.locationIds)
     ? profile.locationIds.filter((id) => typeof id === "string" && id.trim() !== "")
     : [];
@@ -1326,7 +1326,7 @@ function App() {
     const ids = Array.isArray(session.locationIds) ? session.locationIds : [];
     let saved = null;
     try { saved = localStorage.getItem(ACTIVE_LOCATION_KEY); } catch (e) { saved = null; }
-    setActiveLocationId(saved && (ids.includes(saved) || (saved === ALL_LOC && session.role !== "guard" && ids.length > 1)) ? saved : (ids[0] || null));
+    setActiveLocationId(saved && (ids.includes(saved) || (saved === ALL_LOC && !["guard", "hse_manager"].includes(session.role) && ids.length > 1)) ? saved : (ids[0] || null));
   }, [session]);
 
   const openSource = (loc, v) => { changeLocation(loc); setView(v); };
@@ -1369,7 +1369,7 @@ function App() {
   useEffect(() => {
     const db = dbApiRef.current;
 
-    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId || activeLocationId === ALL_LOC) {
+    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId || activeLocationId === ALL_LOC || session.role === "hse_manager") {
       setRoster([]);
       return undefined;
     }
@@ -1401,7 +1401,7 @@ function App() {
   useEffect(() => {
     const db = dbApiRef.current;
 
-    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId || activeLocationId === ALL_LOC) {
+    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId || activeLocationId === ALL_LOC || session.role === "hse_manager") {
       return undefined;
     }
 
@@ -1461,10 +1461,12 @@ function App() {
   // Broken seals for the dashboard (Loading Area only).
   useEffect(() => {
     const db = dbApiRef.current;
-    if (dbModeRef.current !== "firebase" || !db || !session || activeLocationId !== SEAL_LOCATION_ID) { if (activeLocationId !== ALL_LOC) setBrokenSeals([]); return undefined; }
+    if (dbModeRef.current !== "firebase" || !db || !session || session.role === "hse_manager" || activeLocationId !== SEAL_LOCATION_ID) { if (activeLocationId !== ALL_LOC) setBrokenSeals([]); return undefined; }
     const stop = db.collection(`locations/${SEAL_LOCATION_ID}/loadingLogs`).where("seal_status", "==", "BROKEN").onSnapshot((snap) => setBrokenSeals(snap.docs.map((d) => ({ ...d.data(), id: d.id }))), () => setBrokenSeals([]));
     return () => { try { stop(); } catch (e) { /* ignore */ } };
   }, [session, activeLocationId]);
+
+  useEffect(() => { if (session && session.role === "hse_manager") setView("hse"); }, [session]);
 
   // ALL LOCATIONS (read-only overview): lighter queries per location, merged into the same lists the dashboard already uses.
   useEffect(() => {
@@ -1678,6 +1680,9 @@ function getLocationCollection(db, locationId, collectionName) {
           <IncidentsScreen session={session} incidents={incidents} persistIncidents={persist.incidents}
             settings={settings} persistSettings={persist.settings} notify={notify} />
         )}
+        {view === "hse" && (
+          <HSEScreen session={session} getDb={() => dbApiRef.current} locationId={activeLocationId} notify={notify} />
+        )}
         {view === "alerts" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
           <AlertsScreen session={session} getDb={() => dbApiRef.current} notify={notify} openSource={openSource} />
         )}
@@ -1746,7 +1751,7 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
     const loc = syncMode === "firebase" && activeLocationId ? (
       Array.isArray(session.locationIds) && session.locationIds.length > 1 ? (
         <select value={activeLocationId} onChange={(e) => onLocationChange(e.target.value)} aria-label="Location" style={{ fontFamily: FONT_MONO, fontSize: 12, padding: "5px 8px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.45)", background: "rgba(255,255,255,0.16)", color: "#fff" }}>
-          {session.role !== "guard" && <option value="__ALL__" style={{ color: "#111" }}>All locations</option>}
+          {!["guard", "hse_manager"].includes(session.role) && <option value="__ALL__" style={{ color: "#111" }}>All locations</option>}
           {session.locationIds.map((id) => <option key={id} value={id} style={{ color: "#111" }}>{id}</option>)}
         </select>
       ) : <span style={{ fontFamily: FONT_MONO, fontSize: 12, color: "#fff" }}>{activeLocationId}</span>
@@ -1796,7 +1801,7 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
                   aria-label="Location"
                   style={{ fontFamily: FONT_MONO, fontSize: 11, padding: "3px 6px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.4)", background: "rgba(255,255,255,0.16)", color: "#fff" }}
                 >
-                  {session.role !== "guard" && <option value="__ALL__" style={{ color: "#111" }}>All locations</option>}
+                  {!["guard", "hse_manager"].includes(session.role) && <option value="__ALL__" style={{ color: "#111" }}>All locations</option>}
                   {session.locationIds.map((id) => (
                     <option key={id} value={id} style={{ color: "#111" }}>{id}</option>
                   ))}
@@ -1828,6 +1833,7 @@ function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
   const items = [
     { id: "dashboard", label: "Dashboard", icon: Home, roles: ["admin","supervisor","manager","security_manager","guard"] },
     { id: "alerts", label: "Alerts", icon: AlertTriangle, roles: ["admin","supervisor","manager","security_manager"] },
+    { id: "hse", label: "HSE", icon: CheckCircle2, roles: ["admin","supervisor","manager","security_manager","guard","hse_manager"] },
     { id: "checkin", label: "Check In", icon: DoorOpen, roles: ["admin","supervisor","guard"] },
     { id: "checkout", label: "Check Out", icon: DoorClosed, roles: ["admin","supervisor","guard"] },
     { id: "attendance", label: "Today", icon: ClipboardList, roles: ["admin","supervisor","manager","security_manager","guard"] },
@@ -4099,6 +4105,353 @@ function SealReportsScreen({ getDb, notify }) {
           </TableScroll>
         )}
       </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------
+   HSE DAILY SAFETY INSPECTION (per location). Data: locations/{loc}/hseChecklists (versioned),
+   hseInspections (create-only), hsePhotos, hseAlertActions (+/events). Alerts are derived from FAIL items.
+--------------------------------------------------------------------- */
+const HSE_STARTER = [
+  ["Fire Safety", "Are fire extinguishers available at their designated locations?"], ["Fire Safety", "Are fire extinguishers within their expiry date?"],
+  ["Fire Safety", "Are fire extinguishers accessible and not obstructed?"], ["Fire Safety", "Are fire alarm systems and manual call points accessible?"],
+  ["Fire Safety", "Are emergency exit signs visible and functioning?"], ["Emergency Exits", "Are all emergency exit doors functioning properly?"],
+  ["Emergency Exits", "Are emergency exits free from obstruction?"], ["Emergency Exits", "Are emergency escape routes clear?"],
+  ["Emergency Exits", "Are emergency doors accessible and not locked or blocked?"], ["Emergency Exits", "Are evacuation routes clearly marked?"],
+  ["General Workplace Safety", "Are walkways and passages clear?"], ["General Workplace Safety", "Are electrical panels accessible?"],
+  ["General Workplace Safety", "Are electrical cables and sockets in safe condition?"], ["General Workplace Safety", "Are there any water leakages or slippery floors?"],
+  ["General Workplace Safety", "Are emergency equipment and first-aid kits accessible?"],
+];
+const HSE_STATUS_LABEL = { NEW: "New", ACKNOWLEDGED: "Acknowledged", IN_PROGRESS: "In Progress", RESOLVED: "Resolved", CLOSED: "Closed" };
+
+async function runHseAction(db, session, loc, a, action, note, outcome, corrective) {
+  const ts = () => window.firebase.firestore.FieldValue.serverTimestamp();
+  const base = `locations/${loc}/hseAlertActions/${a.key}`, prev = a.w ? a.w.status : "NEW", evId = uid("ev_");
+  const to = { ACKNOWLEDGE: "ACKNOWLEDGED", START: "IN_PROGRESS", RESOLVE: "RESOLVED", CLOSE: "CLOSED", REOPEN: "IN_PROGRESS", COMMENT: prev }[action];
+  const extra = {};
+  if (corrective) extra.corrective_action = corrective;
+  if (action === "RESOLVE") Object.assign(extra, { resolved_by: session.name, resolved_by_uid: session.id, resolved_at: ts(), outcome, resolution_notes: note });
+  if (action === "CLOSE") Object.assign(extra, { closed_by: session.name, closed_by_uid: session.id, closed_at: ts() });
+  if (action === "REOPEN") Object.assign(extra, { resolved_by: null, resolved_by_uid: null, resolved_at: null });
+  const b = db.batch();
+  if (!a.w) {
+    b.set(db.doc(base), { alert_key: a.key, source_id: a.insp.id, item_id: a.item.item_id, status: to, assigned_to: "", assigned_to_uid: "", corrective_action: "", acknowledged_by: session.name, acknowledged_by_uid: session.id, acknowledged_at: ts(), last_event_id: evId, created_at: ts(), created_by_uid: session.id, updated_at: ts(), updated_by_uid: session.id, ...extra });
+  } else {
+    b.update(db.doc(base), { status: to, last_event_id: evId, updated_at: ts(), updated_by_uid: session.id, ...extra });
+  }
+  b.set(db.doc(`${base}/events/${evId}`), { alert_key: a.key, at: ts(), by: session.name, by_uid: session.id, by_role: session.role, action, from_status: prev, to_status: to, note: note || "" });
+  await b.commit();
+}
+
+function HseAlertDetail({ a, session, loc, canTriage, getDb, notify, onClose }) {
+  const [events, setEvents] = useState(null);
+  const [imgs, setImgs] = useState([]);
+  const [note, setNote] = useState("");
+  const [outcome, setOutcome] = useState("");
+  const [corr, setCorr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const base = `locations/${loc}`;
+  useEffect(() => {
+    let off = false;
+    const db = getDb();
+    if (!db) return undefined;
+    db.collection(`${base}/hseAlertActions/${a.key}/events`).orderBy("at").get().then((s) => { if (!off) setEvents(s.docs.map((x) => x.data())); }).catch(() => { if (!off) setEvents([]); });
+    Promise.all((a.item.photo_ids || []).map((p) => db.doc(`${base}/hsePhotos/${p}`).get())).then((ss) => { if (!off) setImgs(ss.filter((x) => x.exists).map((x) => x.data().image)); }).catch(() => {});
+    return () => { off = true; };
+  }, [a.key]);
+  const st = a.w ? a.w.status : "NEW";
+  const act = async (action) => {
+    if (action === "RESOLVE" && (!outcome.trim() || !note.trim())) { notify("Enter the outcome and resolution notes", "error"); return; }
+    if (action === "COMMENT" && !note.trim()) { notify("Write a comment first", "error"); return; }
+    setBusy(true);
+    try { await runHseAction(getDb(), session, loc, a, action, note.trim(), outcome.trim(), corr.trim()); notify("HSE alert updated"); onClose(); }
+    catch (e) { console.error(e); notify(describeFirestoreError(e, "save this action"), "error"); setBusy(false); }
+  };
+  const b = (action, label, tone) => <Btn key={action} size="sm" tone={tone || "navy"} onClick={() => act(action)} disabled={busy}>{label}</Btn>;
+  return (
+    <Modal title="HSE alert" onClose={onClose} wide>
+      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}><Badge tone="missing">FAIL</Badge><Badge tone={st === "CLOSED" || st === "RESOLVED" ? "inside" : "neutral"}>{HSE_STATUS_LABEL[st].toUpperCase()}</Badge></div>
+      <div style={{ fontSize: 13, color: C.ink50 }}>{a.item.category}</div>
+      <div style={{ fontSize: 14.5, fontWeight: 700, color: C.ink, margin: "2px 0 8px" }}>{a.item.question}</div>
+      <div style={{ fontSize: 13.5, marginBottom: 8 }}>{a.item.description || "No description"}</div>
+      <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 10 }}>{loc} · {a.insp.date} {fmtTime(a.insp.time)} · {a.insp.shift} shift · {a.insp.guard_name}</div>
+      {imgs.map((s, i) => <img key={i} src={s} alt="Evidence" style={{ width: "100%", borderRadius: 8, marginBottom: 8 }} />)}
+      {a.w && a.w.corrective_action && <div style={{ fontSize: 12.5, marginBottom: 6 }}><b>Corrective action:</b> {a.w.corrective_action}</div>}
+      {a.w && a.w.outcome && <div style={{ fontSize: 12.5, marginBottom: 6 }}><b>Resolution:</b> {a.w.outcome} — {a.w.resolution_notes}</div>}
+      {canTriage && st !== "CLOSED" && (
+        <div style={{ borderTop: `1px dashed ${C.line}`, marginTop: 12, paddingTop: 12 }}>
+          <Field label="Comment / resolution notes"><textarea style={{ ...inputStyle, minHeight: 56 }} value={note} onChange={(e) => setNote(e.target.value)} /></Field>
+          {st !== "RESOLVED" && <Field label="Corrective action (optional)"><input style={inputStyle} value={corr} onChange={(e) => setCorr(e.target.value)} /></Field>}
+          {st !== "RESOLVED" && <Field label="Outcome (required to resolve)"><input style={inputStyle} value={outcome} onChange={(e) => setOutcome(e.target.value)} /></Field>}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {st === "NEW" && b("ACKNOWLEDGE", "Acknowledge")}
+            {(st === "NEW" || st === "ACKNOWLEDGED") && b("START", "Start work")}
+            {st !== "RESOLVED" && b("RESOLVE", "Mark resolved", "green")}
+            {st !== "NEW" && b("COMMENT", "Add comment", "paper")}
+            {st === "RESOLVED" && b("CLOSE", "Close alert", "green")}
+            {st === "RESOLVED" && session.role === "admin" && b("REOPEN", "Reopen", "red")}
+          </div>
+        </div>
+      )}
+      <div style={{ marginTop: 14 }}>
+        <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 6 }}>Action history</div>
+        {events === null ? <div style={{ fontSize: 12, color: C.ink50 }}>Loading…</div> : events.length === 0 ? <div style={{ fontSize: 12, color: C.ink50 }}>No actions yet.</div> : events.map((e, i) => (
+          <div key={i} style={{ fontSize: 12.5, padding: "6px 0", borderBottom: `1px solid ${C.line}` }}><b>{e.action}</b> by {e.by} ({e.by_role}) · {dubaiStamp(tsMs(e.at))}{e.note ? ` — ${e.note}` : ""}</div>
+        ))}
+      </div>
+    </Modal>
+  );
+}
+
+function HseInspectForm({ checklist, session, loc, getDb, notify, doneShifts, onDone }) {
+  const h = new Date().getHours();
+  const [shift, setShift] = useState(h >= 6 && h < 18 ? "Day" : "Night");
+  const [ans, setAns] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const items = checklist.items || [];
+  const setA = (id, patch) => setAns((a) => ({ ...a, [id]: { ...(a[id] || {}), ...patch } }));
+  const dup = doneShifts.includes(shift);
+  const problem = () => {
+    for (const it of items) {
+      const a = ans[it.id] || {};
+      if (!a.result && it.mandatory) return `Answer: ${it.question}`;
+      if (a.result === "FAIL" && String(a.description || "").trim().length < 3) return `Describe the problem for: ${it.question}`;
+    }
+    return "";
+  };
+  const submit = async () => {
+    const p = problem();
+    if (p) { setErr(p); return; }
+    if (dup) { setErr(`A ${shift} inspection was already submitted today.`); return; }
+    setErr(""); setSaving(true);
+    const db = getDb(), now = new Date(), id = uid("hi_"), base = `locations/${loc}`;
+    try {
+      const built = [];
+      for (const it of items) {
+        const a = ans[it.id] || {};
+        const result = a.result || "NA";
+        const photo_ids = [];
+        if (result === "FAIL") {
+          for (const image of (a.photos || [])) {
+            const pid = uid("hp_");
+            await db.doc(`${base}/hsePhotos/${pid}`).set({ id: pid, inspection_id: id, item_id: it.id, image, created_at: Date.now() });
+            photo_ids.push(pid);
+          }
+        }
+        built.push({ item_id: it.id, category: it.category, question: it.question, mandatory: !!it.mandatory, result, skipped: !a.result, description: result === "FAIL" ? String(a.description).trim() : "", photo_ids });
+      }
+      const cnt = (r) => built.filter((x) => x.result === r).length;
+      await db.doc(`${base}/hseInspections/${id}`).set({
+        date: todayStr(now), time: nowTimeStr(now), shift, guard_name: session.name, guard_uid: session.id, checklist_id: checklist.id, checklist_version: checklist.version,
+        items: built, pass_count: cnt("PASS"), fail_count: cnt("FAIL"), na_count: cnt("NA"), has_fail: cnt("FAIL") > 0, status: "SUBMITTED",
+        submitted_at: window.firebase.firestore.FieldValue.serverTimestamp(), created_at: Date.now(),
+      });
+      notify(cnt("FAIL") ? `Inspection submitted — ${cnt("FAIL")} problem(s) reported to HSE` : "Inspection submitted — all clear");
+      onDone();
+    } catch (e) { console.error(e); setErr(describeFirestoreError(e, "submit the inspection")); setSaving(false); }
+  };
+  const cats = [...new Set(items.map((i) => i.category))];
+  const btn = (it, r, label, color) => {
+    const a = ans[it.id] || {};
+    const blocked = r === "NA" && it.mandatory && !it.allow_na;
+    return <button type="button" disabled={blocked} onClick={() => setA(it.id, { result: a.result === r ? "" : r })} style={{ flex: 1, padding: "9px 6px", borderRadius: 8, fontWeight: 700, fontSize: 13, cursor: blocked ? "not-allowed" : "pointer", opacity: blocked ? 0.35 : 1, border: `2px solid ${a.result === r ? color : C.line}`, background: a.result === r ? color : "#fff", color: a.result === r ? "#fff" : C.ink }}>{label}</button>;
+  };
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
+        {["Day", "Night"].map((s) => <button key={s} type="button" onClick={() => setShift(s)} style={{ padding: "8px 16px", borderRadius: 20, fontWeight: 700, cursor: "pointer", border: `1px solid ${shift === s ? C.navy : C.line}`, background: shift === s ? C.navy : "#fff", color: shift === s ? "#fff" : C.ink }}>{s} shift</button>)}
+        <span style={{ fontSize: 12.5, color: C.ink50 }}>{loc} · {session.name} · checklist v{checklist.version}</span>
+      </div>
+      {dup && <div style={{ background: "#FEF3C7", border: "1px solid #FDE68A", borderRadius: 8, padding: "9px 12px", fontSize: 12.5, color: C.amberDeep, marginBottom: 12 }}>A {shift} inspection has already been submitted today for this location.</div>}
+      {cats.map((c) => (
+        <div key={c} style={{ marginBottom: 14 }}>
+          <div style={{ fontFamily: FONT_SERIF, fontWeight: 800, fontSize: 15, marginBottom: 8 }}>{c}</div>
+          {items.filter((i) => i.category === c).map((it) => {
+            const a = ans[it.id] || {};
+            return (
+              <div key={it.id} style={{ background: "#fff", border: `1px solid ${a.result === "FAIL" ? "#F5B5B5" : C.line}`, borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
+                <div style={{ fontSize: 13.5, marginBottom: 8 }}>{it.question}{it.mandatory ? <span style={{ color: C.red }}> *</span> : <span style={{ color: C.ink50, fontSize: 11.5 }}> (optional)</span>}</div>
+                <div style={{ display: "flex", gap: 6 }}>{btn(it, "PASS", "PASS", "#1F7A4D")}{btn(it, "FAIL", "FAIL", "#B3261E")}{btn(it, "NA", "N/A", "#64748B")}</div>
+                {a.result === "FAIL" && (
+                  <div style={{ marginTop: 8 }}>
+                    <textarea style={{ ...inputStyle, minHeight: 52 }} placeholder="Describe the problem (required)" value={a.description || ""} onChange={(e) => setA(it.id, { description: e.target.value })} />
+                    <div style={{ marginTop: 6 }}><PhotoPicker photos={a.photos || []} setPhotos={(fn) => setA(it.id, { photos: typeof fn === "function" ? fn(a.photos || []) : fn })} max={3} label="Add photo of the problem" /></div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ))}
+      {err && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 13, color: C.redDeep, marginBottom: 10 }}>{err}</div>}
+      <Btn full tone="green" icon={CheckCircle2} onClick={submit} disabled={saving || dup}>{saving ? "Submitting…" : "Submit inspection"}</Btn>
+    </div>
+  );
+}
+
+function HseChecklistAdmin({ active, latest, loc, session, getDb, notify }) {
+  const [draft, setDraft] = useState(() => (active ? active.items : []).map((x) => ({ ...x })));
+  const [busy, setBusy] = useState(false);
+  const upd = (i, patch) => setDraft((d) => d.map((x, j) => (j === i ? { ...x, ...patch } : x)));
+  const cats = [...new Set(draft.map((x) => x.category).filter(Boolean))];
+  const publish = async () => {
+    if (draft.length === 0) { notify("Add at least one question", "error"); return; }
+    if (draft.some((x) => !String(x.category).trim() || !String(x.question).trim())) { notify("Every question needs a category and text", "error"); return; }
+    setBusy(true);
+    try {
+      const db = getDb(), ts = () => window.firebase.firestore.FieldValue.serverTimestamp(), id = uid("chk_"), b = db.batch();
+      const doc = { name: `${loc} checklist`, version: latest + 1, status: "active", items: draft.map((x, i) => ({ id: x.id || uid("q_"), category: String(x.category).trim(), question: String(x.question).trim(), mandatory: !!x.mandatory, allow_na: !!x.allow_na, order: i + 1 })), published_by: session.name, published_by_uid: session.id, published_at: ts() };
+      if (active) doc.replaces = active.id;
+      b.set(db.doc(`locations/${loc}/hseChecklists/${id}`), doc);
+      if (active) b.update(db.doc(`locations/${loc}/hseChecklists/${active.id}`), { status: "archived", archived_at: ts(), archived_by_uid: session.id });
+      await b.commit();
+      notify(`Checklist version ${latest + 1} published`);
+    } catch (e) { console.error(e); notify(describeFirestoreError(e, "publish the checklist"), "error"); }
+    setBusy(false);
+  };
+  return (
+    <div>
+      <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 10, lineHeight: 1.5 }}>This checklist is for <b>{loc}</b> only. Changes become a new version when you press Publish; earlier inspections keep the questions they were done with.{active ? ` Current version: ${active.version}.` : " No checklist yet."}</div>
+      {draft.length === 0 && <Btn size="sm" tone="paper" onClick={() => setDraft(HSE_STARTER.map(([category, question]) => ({ id: uid("q_"), category, question, mandatory: true, allow_na: false })))}>Load starter questions (you can edit them)</Btn>}
+      {draft.map((it, i) => (
+        <div key={it.id || i} style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 8, marginBottom: 6 }}>
+            <input list="hse-cats" style={inputStyle} placeholder="Category" value={it.category} onChange={(e) => upd(i, { category: e.target.value })} />
+            <input style={inputStyle} placeholder="Question" value={it.question} onChange={(e) => upd(i, { question: e.target.value })} />
+          </div>
+          <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap", fontSize: 12.5 }}>
+            <label><input type="checkbox" checked={!!it.mandatory} onChange={(e) => upd(i, { mandatory: e.target.checked })} /> Mandatory</label>
+            <label><input type="checkbox" checked={!!it.allow_na} onChange={(e) => upd(i, { allow_na: e.target.checked })} /> N/A allowed</label>
+            <button type="button" onClick={() => setDraft((d) => d.filter((_, j) => j !== i))} style={{ marginLeft: "auto", background: "none", border: `1px solid ${C.line}`, borderRadius: 6, color: C.redDeep, cursor: "pointer", padding: "3px 10px" }}>Remove</button>
+          </div>
+        </div>
+      ))}
+      <datalist id="hse-cats">{cats.map((c) => <option key={c} value={c} />)}</datalist>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+        <Btn size="sm" tone="paper" icon={UserPlus} onClick={() => setDraft((d) => [...d, { id: uid("q_"), category: (d[d.length - 1] || {}).category || "", question: "", mandatory: true, allow_na: false }])}>Add question</Btn>
+        <Btn size="sm" tone="navy" onClick={publish} disabled={busy}>{busy ? "Publishing…" : `Publish version ${latest + 1}`}</Btn>
+      </div>
+    </div>
+  );
+}
+
+function HSEScreen({ session, getDb, locationId, notify }) {
+  const role = session.role;
+  const canInspect = ["guard", "supervisor", "admin"].includes(role);
+  const canAlerts = ["admin", "hse_manager", "security_manager", "supervisor", "manager"].includes(role);
+  const canTriage = role === "admin" || role === "hse_manager";
+  const [tab, setTab] = useState(canInspect ? "inspect" : "overview");
+  const [checklists, setChecklists] = useState([]);
+  const [insps, setInsps] = useState([]);
+  const [fails, setFails] = useState([]);
+  const [actions, setActions] = useState({});
+  const [err, setErr] = useState("");
+  const [from, setFrom] = useState(todayStr(new Date(Date.now() - 6 * 86400000)));
+  const [q, setQ] = useState("");
+  const [only, setOnly] = useState("ALL");
+  const [detail, setDetail] = useState(null);
+  const [view, setView] = useState(null);
+  useEffect(() => {
+    const db = getDb();
+    if (!db || !locationId) return undefined;
+    let off = false;
+    const stops = [];
+    const base = `locations/${locationId}`;
+    const bad = (k) => (e) => { if (!off) setErr(describeFirestoreError(e, `read ${k}`)); };
+    const docs = (s) => s.docs.map((d) => ({ ...d.data(), id: d.id }));
+    stops.push(db.collection(`${base}/hseChecklists`).onSnapshot((s) => { if (!off) setChecklists(docs(s)); }, bad("the checklist")));
+    stops.push(db.collection(`${base}/hseInspections`).where("date", ">=", from).onSnapshot((s) => { if (!off) setInsps(docs(s)); }, bad("inspections")));
+    if (canAlerts) {
+      stops.push(db.collection(`${base}/hseInspections`).where("has_fail", "==", true).onSnapshot((s) => { if (!off) setFails(docs(s)); }, bad("failed inspections")));
+      stops.push(db.collection(`${base}/hseAlertActions`).onSnapshot((s) => { if (!off) setActions(Object.fromEntries(s.docs.map((d) => [d.id, d.data()]))); }, bad("HSE alerts")));
+    }
+    return () => { off = true; stops.forEach((x) => { try { x(); } catch (e) { /* ignore */ } }); };
+  }, [locationId, from]);
+
+  const active = checklists.filter((c) => c.status === "active").sort((a, b) => b.version - a.version)[0] || null;
+  const latest = Math.max(0, ...checklists.map((c) => c.version || 0));
+  const today = todayStr();
+  const todays = insps.filter((i) => i.date === today);
+  const doneShifts = todays.map((i) => i.shift);
+  const alerts = useMemo(() => fails.flatMap((i) => (i.items || []).filter((it) => it.result === "FAIL").map((it) => { const key = `${i.id}_${it.item_id}`; const w = actions[key] || null; return { key, insp: i, item: it, w, status: w ? w.status : "NEW" }; })).sort((a, b) => (b.insp.date + b.insp.time).localeCompare(a.insp.date + a.insp.time)), [fails, actions]);
+  const openAlerts = alerts.filter((a) => a.status !== "RESOLVED" && a.status !== "CLOSED");
+  const rows = insps.filter((i) => (only === "ALL" || (only === "FAIL" ? i.has_fail : !i.has_fail)) && (!q.trim() || String(i.guard_name).toLowerCase().includes(q.trim().toLowerCase()))).sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+  const exportCsv = () => {
+    const out = rows.flatMap((i) => (i.items || []).map((it) => ({ i, it })));
+    if (!out.length) { notify("Nothing to export", "error"); return; }
+    downloadFile(`hse-inspections-${from}_${today}.csv`, toCSV(out, [
+      { label: "Date", get: (r) => r.i.date }, { label: "Time", get: (r) => r.i.time }, { label: "Shift", get: (r) => r.i.shift }, { label: "Location", get: () => locationId },
+      { label: "Guard", get: (r) => r.i.guard_name }, { label: "Checklist version", get: (r) => r.i.checklist_version }, { label: "Category", get: (r) => r.it.category },
+      { label: "Question", get: (r) => r.it.question }, { label: "Result", get: (r) => r.it.result }, { label: "Problem description", get: (r) => r.it.description || "" },
+      { label: "Photos", get: (r) => (r.it.photo_ids || []).length || "" },
+    ]), "text/csv");
+  };
+  const tabs = [...(canInspect ? [["inspect", "Inspect"]] : []), ["overview", "Overview"], ...(canAlerts ? [["alerts", `Alerts${openAlerts.length ? ` (${openAlerts.length})` : ""}`]] : []), ...(role === "admin" ? [["checklist", "Checklist"]] : [])];
+
+  return (
+    <div>
+      <SectionTitle title="HSE Daily Safety Inspection" sub={locationId} />
+      {err && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 12.5, color: C.redDeep, marginBottom: 12 }}>{err}</div>}
+      <div className="no-print" style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+        {tabs.map(([k, l]) => <button key={k} onClick={() => setTab(k)} style={{ padding: "7px 12px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer", border: `1px solid ${tab === k ? C.navy : C.line}`, background: tab === k ? C.navy : "#fff", color: tab === k ? "#fff" : C.ink }}>{l}</button>)}
+      </div>
+
+      {tab === "inspect" && (active ? <HseInspectForm key={active.id} checklist={active} session={session} loc={locationId} getDb={getDb} notify={notify} doneShifts={doneShifts} onDone={() => setTab("overview")} />
+        : <EmptyState icon={CheckCircle2} title="No checklist is set up for this location yet" sub="Ask the Admin to publish one under HSE → Checklist." />)}
+
+      {tab === "overview" && (
+        <div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 10, marginBottom: 14 }}>
+            <StatCard label="Inspections today" value={todays.length} icon={ClipboardList} tone="navy" />
+            <StatCard label="Pending shifts today" value={["Day", "Night"].filter((s) => !doneShifts.includes(s)).join(" + ") || "None"} icon={Clock} tone="amber" />
+            <StatCard label="PASS items today" value={todays.reduce((n, i) => n + (i.pass_count || 0), 0)} icon={CheckCircle2} tone="green" />
+            <StatCard label="FAIL items today" value={todays.reduce((n, i) => n + (i.fail_count || 0), 0)} icon={AlertTriangle} tone="red" />
+            {canAlerts && <StatCard label="Open HSE alerts" value={openAlerts.length} icon={AlertTriangle} tone="red" onClick={() => setTab("alerts")} />}
+            {canAlerts && <StatCard label="Resolved alerts" value={alerts.length - openAlerts.length} icon={CheckCircle2} tone="teal" />}
+          </div>
+          <div className="no-print" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 8, marginBottom: 10 }}>
+            <input type="date" style={inputStyle} value={from} onChange={(e) => setFrom(e.target.value)} aria-label="From date" />
+            <input style={inputStyle} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Guard name" />
+            <select style={inputStyle} value={only} onChange={(e) => setOnly(e.target.value)} aria-label="Result"><option value="ALL">All inspections</option><option value="FAIL">With problems</option><option value="PASS">All clear</option></select>
+            <Btn size="sm" tone="paper" icon={FileDown} onClick={exportCsv}>CSV</Btn>
+            <Btn size="sm" tone="paper" icon={FileDown} onClick={() => window.print()}>PDF (Print)</Btn>
+          </div>
+          <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden" }}>
+            {rows.length === 0 ? <EmptyState icon={ClipboardList} title="No inspections in this period" /> : (
+              <TableScroll headers={["Date / time", "Shift", "Guard", "Version", "Pass", "Fail", "N/A", "Result", ""]}>
+                {rows.map((i) => (
+                  <tr key={i.id}><Td>{i.date} {fmtTime(i.time)}</Td><Td>{i.shift}</Td><Td>{i.guard_name}</Td><Td>v{i.checklist_version}</Td><Td>{i.pass_count}</Td><Td>{i.fail_count}</Td><Td>{i.na_count}</Td>
+                    <Td><Badge tone={i.has_fail ? "missing" : "inside"}>{i.has_fail ? "PROBLEMS" : "ALL CLEAR"}</Badge></Td>
+                    <Td><button onClick={() => setView(i)} style={{ background: "none", border: "none", color: C.navy, cursor: "pointer", fontWeight: 600 }}>View</button></Td></tr>
+                ))}
+              </TableScroll>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === "alerts" && canAlerts && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {alerts.length === 0 ? <EmptyState icon={CheckCircle2} title="No HSE alerts" sub="Alerts appear when a guard marks an item FAIL." /> : alerts.map((a) => (
+            <button key={a.key} onClick={() => setDetail(a)} style={{ textAlign: "left", width: "100%", background: "#fff", border: `1px solid ${C.line}`, borderLeft: `4px solid ${a.status === "RESOLVED" || a.status === "CLOSED" ? C.green : C.red}`, borderRadius: 10, padding: "11px 13px", cursor: "pointer" }}>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}><Badge tone="missing">FAIL</Badge><Badge tone="neutral">{a.item.category.toUpperCase()}</Badge><Badge tone={a.status === "RESOLVED" || a.status === "CLOSED" ? "inside" : "neutral"}>{HSE_STATUS_LABEL[a.status].toUpperCase()}</Badge><span style={{ marginLeft: "auto", fontSize: 11.5, color: C.ink50 }}>{a.insp.date} {fmtTime(a.insp.time)}</span></div>
+              <div style={{ fontSize: 13.5, fontWeight: 600, marginTop: 6 }}>{a.item.question}</div>
+              <div style={{ fontSize: 12.5, color: C.ink50, marginTop: 3 }}>{a.item.description} — {a.insp.guard_name} ({a.insp.shift})</div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {tab === "checklist" && role === "admin" && <HseChecklistAdmin key={active ? active.id : "none"} active={active} latest={latest} loc={locationId} session={session} getDb={getDb} notify={notify} />}
+      {detail && <HseAlertDetail a={detail} session={session} loc={locationId} canTriage={canTriage} getDb={getDb} notify={notify} onClose={() => setDetail(null)} />}
+      {view && (
+        <Modal title={`Inspection — ${view.date} ${view.shift}`} onClose={() => setView(null)} wide>
+          <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 10 }}>{view.guard_name} · {fmtTime(view.time)} · checklist v{view.checklist_version}</div>
+          {(view.items || []).map((it) => <div key={it.item_id} style={{ padding: "7px 0", borderBottom: `1px solid ${C.line}`, fontSize: 13 }}><Badge tone={it.result === "FAIL" ? "missing" : it.result === "PASS" ? "inside" : "neutral"}>{it.result}</Badge> <span style={{ color: C.ink50 }}>{it.category} ·</span> {it.question}{it.description ? <div style={{ color: C.redDeep, fontSize: 12.5 }}>{it.description}</div> : null}</div>)}
+        </Modal>
+      )}
     </div>
   );
 }
