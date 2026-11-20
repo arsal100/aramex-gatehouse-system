@@ -3545,7 +3545,7 @@ function sealAlertMessage(rec) {
   return { subject, body: lines.join("\n") };
 }
 
-function SealForm({ direction, onClose, onSave }) {
+function SealForm({ direction, onClose, onSave, insideList }) {
   const isIn = direction === "IN";
   const fileRef = useRef(null);
   const [photo, setPhoto] = useState(null);
@@ -3561,6 +3561,14 @@ function SealForm({ direction, onClose, onSave }) {
   const [destination, setDestination] = useState("");
   const [chamber, setChamber] = useState("");
   const [shipments, setShipments] = useState("");
+  const [company, setCompany] = useState("");
+  const [phone, setPhone] = useState("");
+  const [breakDetails, setBreakDetails] = useState("");
+  const [linkId, setLinkId] = useState("");
+  const [lines, setLines] = useState([]);
+  const setLine = (i, k, v) => setLines((l) => l.map((x, j) => (j === i ? { ...x, [k]: v } : x)));
+  const cleaned = () => lines.filter((x) => String(x.description).trim() || Number(x.shipments) || Number(x.pieces)).map((x) => ({ description: String(x.description).trim(), shipments: Math.max(0, Math.floor(Number(x.shipments) || 0)), pieces: Math.max(0, Math.floor(Number(x.pieces) || 0)) }));
+  const pickInside = (mid) => { setLinkId(mid); const v = (insideList || []).find((x) => x.movement_id === mid); if (v) { setDriver(v.driver_name || ""); setVehicle(v.vehicle_number || ""); setCompany(v.vehicle_company || ""); setPhone(v.driver_phone || ""); } };
   const [remarks, setRemarks] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -3606,7 +3614,7 @@ function SealForm({ direction, onClose, onSave }) {
       await onSave({
         direction, seal_number: seal, seal_status: sealStatus, driver_name: driver.trim(), vehicle_number: vehicle.trim().toUpperCase(),
         department: chamber, origin: isIn ? origin.trim() : "", destination: isIn ? "" : destination.trim(),
-        shipment_count: count, remarks: remarks.trim(), ocr_text: ocrText,
+        shipment_count: cleaned().length ? cleaned().reduce((n, x) => n + x.shipments, 0) : count, vehicle_company: company.trim(), driver_phone: phone.trim(), seal_break_details: sealStatus === "BROKEN" ? breakDetails.trim() : "", movement_id: linkId, shipment_lines: cleaned(), total_shipments: cleaned().reduce((n, x) => n + x.shipments, 0), total_pieces: cleaned().reduce((n, x) => n + x.pieces, 0), remarks: remarks.trim(), ocr_text: ocrText,
       }, photo);
     } catch (e) {
       setSaving(false); // the failed save already showed an error message
@@ -3647,6 +3655,14 @@ function SealForm({ direction, onClose, onSave }) {
         <div style={{ display: "flex", gap: 8 }}>{choice("INTACT", "Intact (OK)", "#1F7A4D")}{choice("BROKEN", "Broken / tampered", "#B3261E")}</div>
         {sealStatus === "BROKEN" && <div style={{ fontSize: 12, color: C.redDeep, marginTop: 6 }}>A broken seal is flagged in red. Add details in Remarks and notify the concerned people after saving.</div>}
       </div>
+      {!isIn && (insideList || []).length > 0 && (
+        <Field label="Which vehicle is leaving? (optional — links this exit to its entry)">
+          <select style={inputStyle} value={linkId} onChange={(e) => pickInside(e.target.value)}>
+            <option value="">Not listed / not linked</option>
+            {insideList.map((v) => <option key={v.id} value={v.movement_id}>{v.vehicle_number || "—"} · {v.driver_name} · in {fmtTime(v.time)}</option>)}
+          </select>
+        </Field>
+      )}
       <Field label="Driver name *"><input style={inputStyle} value={driver} onChange={(e) => setDriver(e.target.value)} /></Field>
       <Field label="Vehicle number"><input style={inputStyle} value={vehicle} onChange={(e) => setVehicle(e.target.value)} autoCapitalize="characters" /></Field>
       {isIn ? (
@@ -3661,6 +3677,23 @@ function SealForm({ direction, onClose, onSave }) {
         </select>
       </Field>
       <Field label="Number of shipments (optional)"><input type="number" min="0" style={inputStyle} value={shipments} onChange={(e) => setShipments(e.target.value)} /></Field>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <Field label="Transport company"><input style={inputStyle} value={company} onChange={(e) => setCompany(e.target.value)} /></Field>
+        <Field label="Driver contact number"><input style={inputStyle} value={phone} onChange={(e) => setPhone(e.target.value)} inputMode="tel" /></Field>
+      </div>
+      {sealStatus === "BROKEN" && <Field label="Seal break details"><textarea style={{ ...inputStyle, minHeight: 56 }} value={breakDetails} onChange={(e) => setBreakDetails(e.target.value)} placeholder="How was it found broken? Who was informed?" /></Field>}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 12.5, fontWeight: 600, color: C.ink50, marginBottom: 5 }}>Shipment lines on this vehicle (optional — one line per shipment group; totals are added up for you)</div>
+        {lines.map((ln, i) => (
+          <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr auto", gap: 6, marginBottom: 6 }}>
+            <input style={inputStyle} placeholder="Description" value={ln.description} onChange={(e) => setLine(i, "description", e.target.value)} />
+            <input type="number" min="0" style={inputStyle} placeholder="Shipments" value={ln.shipments} onChange={(e) => setLine(i, "shipments", e.target.value)} />
+            <input type="number" min="0" style={inputStyle} placeholder="Pieces" value={ln.pieces} onChange={(e) => setLine(i, "pieces", e.target.value)} />
+            <button type="button" aria-label="Remove line" onClick={() => setLines((l) => l.filter((_, j) => j !== i))} style={{ background: "none", border: `1px solid ${C.line}`, borderRadius: 7, color: C.redDeep, cursor: "pointer", padding: "0 10px" }}>×</button>
+          </div>
+        ))}
+        <button type="button" onClick={() => setLines((l) => [...l, { description: "", shipments: "", pieces: "" }])} style={{ background: "none", border: "none", color: C.navy, fontSize: 12.5, fontWeight: 600, cursor: "pointer", padding: 0 }}>+ Add shipment line</button>
+      </div>
       <Field label="Remarks (optional)"><input style={inputStyle} value={remarks} onChange={(e) => setRemarks(e.target.value)} /></Field>
 
       {error && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 13, color: C.redDeep, marginBottom: 12 }}>{error}</div>}
@@ -3687,6 +3720,8 @@ function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
   const [preset, setPreset] = useState("week");
   const [search, setSearch] = useState("");
   const [notifyTo, setNotifyTo] = useState("");
+  const [tab, setTab] = useState("log");
+  const canReport = ["admin", "supervisor", "security_manager"].includes(session.role);
 
   useEffect(() => {
     if (!hasAccess) { setLoading(false); return undefined; }
@@ -3713,12 +3748,14 @@ function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
     return <EmptyState icon={ShieldCheck} title="Seal Register is not available for your account" sub={`Your account needs access to ${SEAL_LOCATION_ID}. Ask the administrator to add it to your staff profile.`} />;
   }
 
+  if (tab === "reports" && canReport) return (<div><SealTabs tab={tab} setTab={setTab} canReport={canReport} /><SealReportsScreen getDb={getDb} notify={notify} /></div>);
+
   const saveRecord = async (fields, photoDataUrl) => {
     const db = getDb();
     const now = new Date();
     const id = uid("sr_");
     const rec = {
-      id, ...fields, has_photo: !!photoDataUrl,
+      id, ...fields, movement_id: fields.direction === "IN" ? id : (fields.movement_id || id), has_photo: !!photoDataUrl,
       date: todayStr(now), time: nowTimeStr(now), recorded_by: session.name, recorded_by_id: session.id, created_at: Date.now(),
     };
     try {
@@ -3763,6 +3800,7 @@ function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
     }
   };
 
+  const inside = logs.filter((l) => l.direction === "IN" && l.movement_id && !logs.some((o) => o.direction === "OUT" && o.movement_id === l.movement_id));
   const range = preset === "all" ? null : inventoryPresetRange(preset);
   const q = search.trim().toLowerCase();
   const shown = logs.filter((l) => {
@@ -3795,11 +3833,18 @@ function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
   return (
     <div>
       <SectionTitle title="Seal Register" sub={`${SEAL_LOCATION_ID} · vehicles IN and OUT`} />
+      <SealTabs tab={tab} setTab={setTab} canReport={canReport} />
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
         <Btn tone="green" size="lg" icon={DoorOpen} onClick={() => setShowForm("IN")}>Vehicle IN</Btn>
         <Btn tone="navy" size="lg" icon={DoorClosed} onClick={() => setShowForm("OUT")}>Vehicle OUT</Btn>
       </div>
+      {inside.length > 0 && (
+        <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Vehicles inside now ({inside.length})</div>
+          {inside.slice(0, 8).map((v) => <div key={v.id} style={{ fontSize: 12.5, color: C.ink, padding: "2px 0" }}>{v.vehicle_number || "—"} · {v.driver_name} · in at {fmtTime(v.time)}</div>)}
+        </div>
+      )}
 
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
         {[["ALL", "All"], ["IN", "IN"], ["OUT", "OUT"]].map(([k, label]) => pill(dirFilter === k, () => setDirFilter(k), label))}
@@ -3854,7 +3899,7 @@ function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
         })}
       </div>
 
-      {showForm && <SealForm direction={showForm} onClose={() => setShowForm(null)} onSave={saveRecord} />}
+      {showForm && <SealForm direction={showForm} onClose={() => setShowForm(null)} onSave={saveRecord} insideList={inside} />}
 
       {saved && (
         <Modal title="Notify the concerned people" onClose={() => setSaved(null)}>
@@ -3878,6 +3923,182 @@ function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
       )}
 
       {showEmails && <SealEmailsModal recipients={recipients} onSave={saveEmails} onClose={() => setShowEmails(false)} />}
+    </div>
+  );
+}
+
+function SealTabs({ tab, setTab, canReport }) {
+  if (!canReport) return null;
+  return (
+    <div className="no-print" style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+      {[["log", "Register"], ["reports", "Vehicle & Shipment Reports"]].map(([k, l]) => (
+        <button key={k} onClick={() => setTab(k)} style={{ padding: "7px 12px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer", border: `1px solid ${tab === k ? C.navy : C.line}`, background: tab === k ? C.navy : "#fff", color: tab === k ? "#fff" : C.ink }}>{l}</button>
+      ))}
+    </div>
+  );
+}
+
+function DayBars({ data }) {
+  const max = Math.max(1, ...data.flatMap((d) => [d.inV, d.outV]));
+  const w = Math.max(320, data.length * 34);
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <svg width={w} height="150" viewBox={`0 0 ${w} 150`} role="img" aria-label="Vehicles per day">
+        {data.map((d, i) => {
+          const x = 10 + i * 34, hi = (d.inV / max) * 100, ho = (d.outV / max) * 100;
+          return (
+            <g key={d.k}>
+              <rect x={x} y={110 - hi} width="12" height={hi} fill="#1F7A4D" rx="2" />
+              <rect x={x + 14} y={110 - ho} width="12" height={ho} fill={C.aramexRed} rx="2" />
+              <text x={x + 13} y="126" textAnchor="middle" fontSize="9" fill={C.ink50}>{d.k.slice(8)}</text>
+              <text x={x + 13} y="140" textAnchor="middle" fontSize="8" fill={C.ink50}>{d.k.slice(5, 7)}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <div style={{ fontSize: 11.5, color: C.ink50 }}><span style={{ color: "#1F7A4D" }}>■</span> Inbound vehicles &nbsp; <span style={{ color: C.aramexRed }}>■</span> Outbound vehicles (by day of month)</div>
+    </div>
+  );
+}
+
+function GroupTable({ title, data, label }) {
+  return (
+    <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", marginBottom: 14 }}>
+      <div style={{ padding: "10px 12px", fontWeight: 700, fontSize: 13.5 }}>{title}</div>
+      {data.length === 0 ? <EmptyState icon={Truck} title="No records" /> : (
+        <TableScroll headers={[label, "Vehicles IN", "Vehicles OUT", "Shipments IN", "Shipments OUT", "Pieces IN", "Pieces OUT"]}>
+          {data.map((g) => (
+            <tr key={g.k}><Td>{g.k}</Td><Td>{g.inV}</Td><Td>{g.outV}</Td><Td>{g.inS}</Td><Td>{g.outS}</Td><Td>{g.inP}</Td><Td>{g.outP}</Td></tr>
+          ))}
+        </TableScroll>
+      )}
+    </div>
+  );
+}
+
+function SealReportsScreen({ getDb, notify }) {
+  const init = inventoryPresetRange("week");
+  const [preset, setPreset] = useState("week");
+  const [from, setFrom] = useState(init.from);
+  const [to, setTo] = useState(init.to);
+  const [month, setMonth] = useState(todayStr().slice(0, 7));
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [tick, setTick] = useState(0);
+  const [f, setF] = useState({ dir: "ALL", vehicle: "", driver: "", origin: "", dest: "", seal: "", chamber: "" });
+  const sf = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.value }));
+  const setMonthRange = (m) => { const [y, mo] = m.split("-").map(Number); setMonth(m); setFrom(`${m}-01`); setTo(`${m}-${String(new Date(y, mo, 0).getDate()).padStart(2, "0")}`); };
+  const pick = (p) => { setPreset(p); if (p === "month") setMonthRange(month); else if (p !== "custom") { const r = inventoryPresetRange(p); setFrom(r.from); setTo(r.to); } };
+
+  useEffect(() => {
+    const db = getDb();
+    if (!db || !from || !to || from > to) return undefined;
+    let off = false;
+    setLoading(true); setErr("");
+    db.collection(`locations/${SEAL_LOCATION_ID}/loadingLogs`).where("date", ">=", from).where("date", "<=", to).get()
+      .then((s) => { if (!off) { setLogs(s.docs.map((d) => ({ ...d.data(), id: d.id }))); setLoading(false); } })
+      .catch((e) => { if (!off) { setErr(describeFirestoreError(e, "load the report")); setLoading(false); } });
+    return () => { off = true; };
+  }, [from, to, tick]);
+
+  const lns = (l) => (Array.isArray(l.shipment_lines) && l.shipment_lines.length ? l.shipment_lines : null);
+  const ship = (l) => (lns(l) ? lns(l).reduce((n, x) => n + (Number(x.shipments) || 0), 0) : (Number(l.shipment_count) || 0));
+  const pcs = (l) => (lns(l) ? lns(l).reduce((n, x) => n + (Number(x.pieces) || 0), 0) : null);
+  const sum = (arr, fn) => arr.reduce((n, r) => n + (fn(r) || 0), 0);
+  const rows = useMemo(() => {
+    const has = (v, q) => !q.trim() || String(v || "").toLowerCase().includes(q.trim().toLowerCase());
+    return logs.filter((l) => (f.dir === "ALL" || l.direction === f.dir) && has(l.vehicle_number, f.vehicle) && has(l.driver_name, f.driver) && has(l.origin, f.origin) && has(l.destination, f.dest) && has(l.seal_number, f.seal) && (!f.chamber || l.department === f.chamber))
+      .sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+  }, [logs, f]);
+  const IN = rows.filter((r) => r.direction === "IN"), OUT = rows.filter((r) => r.direction === "OUT");
+  const noPieces = rows.filter((r) => pcs(r) === null).length;
+  const group = (arr, keyFn) => {
+    const m = new Map();
+    arr.forEach((r) => {
+      const k = keyFn(r) || "—";
+      const g = m.get(k) || { k, inV: 0, outV: 0, inS: 0, outS: 0, inP: 0, outP: 0 };
+      if (r.direction === "IN") { g.inV += 1; g.inS += ship(r); g.inP += pcs(r) || 0; } else { g.outV += 1; g.outS += ship(r); g.outP += pcs(r) || 0; }
+      m.set(k, g);
+    });
+    return [...m.values()];
+  };
+  const byDay = group(rows, (r) => r.date).sort((a, b) => a.k.localeCompare(b.k));
+  const byWeek = group(rows, (r) => "Week of " + todayStr(startOfWeek(new Date(r.date + "T00:00:00")))).sort((a, b) => a.k.localeCompare(b.k));
+  const lineText = (r) => (lns(r) ? lns(r).map((x) => `${x.description || "shipment"}: ${x.shipments || 0} shipment(s), ${x.pieces || 0} piece(s)`).join(" | ") : "");
+
+  const headers = [
+    { label: "Date", get: (r) => r.date }, { label: "Time", get: (r) => r.time }, { label: "Movement", get: (r) => (r.direction === "IN" ? "INBOUND" : "OUTBOUND") },
+    { label: "Vehicle", get: (r) => r.vehicle_number || "" }, { label: "Transport company", get: (r) => r.vehicle_company || "" }, { label: "Driver", get: (r) => r.driver_name || "" },
+    { label: "Driver phone", get: (r) => r.driver_phone || "" }, { label: "Seal number", get: (r) => r.seal_number }, { label: "Seal condition", get: (r) => r.seal_status },
+    { label: "Seal break details", get: (r) => r.seal_break_details || "" }, { label: "Chamber", get: (r) => r.department || "" }, { label: "Origin", get: (r) => r.origin || "" },
+    { label: "Destination", get: (r) => r.destination || "" }, { label: "Shipments", get: (r) => ship(r) }, { label: "Pieces", get: (r) => (pcs(r) === null ? "not recorded" : pcs(r)) },
+    { label: "Shipment lines", get: lineText }, { label: "Remarks", get: (r) => r.remarks || "" }, { label: "Recorded by", get: (r) => r.recorded_by || "" }, { label: "Movement ID", get: (r) => r.movement_id || "" },
+  ];
+  const exportCsv = () => {
+    if (!rows.length) { notify("Nothing to export for these filters", "error"); return; }
+    const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const head = [["Vehicle and Shipment Movement Report"], ["Location", SEAL_LOCATION_ID], ["Period", `${from} to ${to}`], ["Inbound vehicles", IN.length], ["Outbound vehicles", OUT.length], ["Inbound shipments", sum(IN, ship)], ["Outbound shipments", sum(OUT, ship)], ["Inbound pieces (where recorded)", sum(IN, pcs)], ["Outbound pieces (where recorded)", sum(OUT, pcs)], ["Records without piece counts", noPieces], []].map((r) => r.map(q).join(",")).join("\n");
+    downloadFile(`vehicle-movements-${from}_${to}.csv`, head + "\n" + toCSV(rows, headers), "text/csv");
+  };
+
+  return (
+    <div>
+      <div className="no-print">
+        <SectionTitle title="Vehicle & Shipment Movement Report" sub={`${SEAL_LOCATION_ID} · every vehicle entering and leaving`} />
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 8, marginBottom: 10 }}>
+          <select style={inputStyle} value={preset} onChange={(e) => pick(e.target.value)} aria-label="Period"><option value="today">Today</option><option value="week">This week</option><option value="month">Month</option><option value="custom">Custom dates</option></select>
+          {preset === "month" && <input type="month" style={inputStyle} value={month} onChange={(e) => setMonthRange(e.target.value)} />}
+          <input type="date" style={inputStyle} value={from} onChange={(e) => { setFrom(e.target.value); setPreset("custom"); }} aria-label="From" />
+          <input type="date" style={inputStyle} value={to} onChange={(e) => { setTo(e.target.value); setPreset("custom"); }} aria-label="To" />
+          <select style={inputStyle} value={f.dir} onChange={sf("dir")} aria-label="Movement"><option value="ALL">Inbound and outbound</option><option value="IN">Inbound only</option><option value="OUT">Outbound only</option></select>
+          <input style={inputStyle} value={f.vehicle} onChange={sf("vehicle")} placeholder="Vehicle number" />
+          <input style={inputStyle} value={f.driver} onChange={sf("driver")} placeholder="Driver name" />
+          <input style={inputStyle} value={f.origin} onChange={sf("origin")} placeholder="Origin" />
+          <input style={inputStyle} value={f.dest} onChange={sf("dest")} placeholder="Destination" />
+          <input style={inputStyle} value={f.seal} onChange={sf("seal")} placeholder="Seal number" />
+          <select style={inputStyle} value={f.chamber} onChange={sf("chamber")} aria-label="Chamber"><option value="">All chambers</option>{SEAL_CHAMBERS.map((c) => <option key={c} value={c}>{c}</option>)}</select>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+          <Btn size="sm" tone="paper" icon={RefreshCw} onClick={() => setTick((t) => t + 1)} disabled={loading}>{loading ? "Loading…" : "Refresh"}</Btn>
+          <Btn size="sm" tone="paper" icon={FileDown} onClick={exportCsv}>CSV</Btn>
+          <Btn size="sm" tone="paper" icon={FileDown} onClick={() => window.print()}>PDF (Print)</Btn>
+        </div>
+        {err && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 12.5, color: C.redDeep, marginBottom: 12 }}>{err}</div>}
+      </div>
+      <div style={{ fontFamily: FONT_SERIF, fontSize: 17, fontWeight: 800, marginBottom: 4 }}>Vehicle and Shipment Movement Report</div>
+      <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 12 }}>{SEAL_LOCATION_ID} · {fmtDate(from)} to {fmtDate(to)} · {rows.length} movement record(s)</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 10, marginBottom: 14 }}>
+        <StatCard label="Inbound vehicles" value={IN.length} icon={DoorOpen} tone="green" />
+        <StatCard label="Outbound vehicles" value={OUT.length} icon={DoorClosed} tone="red" />
+        <StatCard label="Inbound shipments" value={sum(IN, ship)} icon={Package} tone="teal" />
+        <StatCard label="Outbound shipments" value={sum(OUT, ship)} icon={Package} tone="amber" />
+        <StatCard label="Inbound pieces" value={sum(IN, pcs)} icon={Package} tone="slate" />
+        <StatCard label="Outbound pieces" value={sum(OUT, pcs)} icon={Package} tone="slate" />
+      </div>
+      {noPieces > 0 && <div style={{ fontSize: 12, color: C.amberDeep, marginBottom: 12 }}>{noPieces} record(s) have no piece count (older entries or none entered); pieces are totalled only where recorded.</div>}
+      {byDay.length > 0 && <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 12, marginBottom: 14 }}><DayBars data={byDay} /></div>}
+      <GroupTable title="Daily summary" data={byDay} label="Date" />
+      {byWeek.length > 1 && <GroupTable title="Weekly summary" data={byWeek} label="Week" />}
+      <GroupTable title="Driver-wise" data={group(rows, (r) => r.driver_name).sort((a, b) => (b.inV + b.outV) - (a.inV + a.outV))} label="Driver" />
+      <GroupTable title="Vehicle-wise" data={group(rows, (r) => r.vehicle_number).sort((a, b) => (b.inV + b.outV) - (a.inV + a.outV))} label="Vehicle" />
+      <GroupTable title="Shipment origin (inbound)" data={group(IN, (r) => r.origin)} label="Origin" />
+      <GroupTable title="Shipment destination (outbound)" data={group(OUT, (r) => r.destination)} label="Destination" />
+      <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden" }}>
+        <div style={{ padding: "10px 12px", fontWeight: 700, fontSize: 13.5 }}>Movement records{rows.length > 300 ? " (first 300 shown — the CSV has all)" : ""}</div>
+        {rows.length === 0 ? <EmptyState icon={Truck} title="No movements for these filters" /> : (
+          <TableScroll headers={["Date / time", "Movement", "Vehicle", "Driver", "Company", "Seal", "Condition", "Chamber", "From / To", "Shipments", "Pieces", "By"]}>
+            {rows.slice(0, 300).map((r) => (
+              <tr key={r.id}>
+                <Td>{r.date} {fmtTime(r.time)}</Td><Td><Badge tone={r.direction === "IN" ? "inside" : "out"}>{r.direction === "IN" ? "INBOUND" : "OUTBOUND"}</Badge></Td>
+                <Td>{r.vehicle_number || "—"}</Td><Td>{r.driver_name || "—"}</Td><Td>{r.vehicle_company || "—"}</Td><TdMono>{r.seal_number}</TdMono>
+                <Td><Badge tone={r.seal_status === "BROKEN" ? "missing" : "inside"}>{r.seal_status}</Badge></Td><Td>{r.department || "—"}</Td>
+                <Td>{r.direction === "IN" ? (r.origin || "—") : (r.destination || "—")}</Td><Td>{ship(r)}</Td><Td>{pcs(r) === null ? "—" : pcs(r)}</Td><Td>{r.recorded_by || "—"}</Td>
+              </tr>
+            ))}
+          </TableScroll>
+        )}
+      </div>
     </div>
   );
 }
