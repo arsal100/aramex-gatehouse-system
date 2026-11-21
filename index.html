@@ -492,6 +492,26 @@ async function saveKey(key, value) {
    this is what makes two devices checking people in at the same time
    not clobber each other.
 --------------------------------------------------------------------- */
+// ---- Offline-friendly saving: writes are kept on the phone and uploaded when the internet returns ----
+const WRITES = { n: 0, subs: new Set(), lastToast: 0 };
+const trackWrite = (p) => {
+  WRITES.n += 1; WRITES.subs.forEach((f) => f());
+  const done = () => { WRITES.n -= 1; WRITES.subs.forEach((f) => f()); };
+  p.then(done, done);
+  return p;
+};
+// Waits briefly for the server. If it is slow or offline, the entry stays queued on the phone and the user can carry on.
+async function settleOrQueue(promise, notifyFn, what, track = true) {
+  const p = Promise.resolve(promise);
+  if (track) trackWrite(p);
+  const r = await Promise.race([p.then(() => "ok"), new Promise((res) => setTimeout(() => res("slow"), 3500))]);
+  if (r === "slow") {
+    p.catch((e) => { console.error("Queued write failed:", what, e); notifyFn(describeFirestoreError(e, `finish saving ${what}`), "error"); });
+    if (Date.now() - WRITES.lastToast > 10000) { WRITES.lastToast = Date.now(); notifyFn("Saved on this phone — it will upload when the internet returns"); }
+  }
+  return r;
+}
+
 function cleanForStore(obj) {
   // Firestore rejects `undefined` field values outright; Claude's db is fine
   // with them but there's no reason not to normalize either way.
@@ -509,7 +529,7 @@ async function syncArrayToCollection(db, collectionPath, prevArray, nextArray) {
   for (const id of prevById.keys()) {
     if (!nextById.has(id)) ops.push(col.doc(id).delete());
   }
-  await Promise.all(ops);
+  return Promise.all(ops.map((p) => trackWrite(p)));
 }
 
 /* ---------------------------------------------------------------------
@@ -607,6 +627,7 @@ async function initFirebaseDb(config) {
   const app = existing || window.firebase.initializeApp(config);
   const auth = window.firebase.auth(app);
   const db = window.firebase.firestore(app);
+  try { await db.enablePersistence({ synchronizeTabs: true }); } catch (e) { console.warn("Offline storage is not available on this browser:", e && e.code); }
 
   return { app, auth, db };
 }
@@ -1009,7 +1030,8 @@ function App() {
   const [activeLocationId, setActiveLocationId] = useState(null); // Firebase mode only
   const [dataError, setDataError] = useState("");
   const [roster, setRoster] = useState([]);
-  const [brokenSeals, setBrokenSeals] = useState([]); // guards at the active location (Firebase mode)
+  const [brokenSeals, setBrokenSeals] = useState([]);
+  const [attDays, setAttDays] = useState(60); // guards at the active location (Firebase mode)
   const activeLocationIdRef = useRef(null); activeLocationIdRef.current = activeLocationId;
   const dbApiRef = useRef(null);
   const [vw, setVw] = useState(window.innerWidth);
@@ -1251,7 +1273,7 @@ function App() {
     }
 
     try {
-      await syncArrayToCollection(db, path, prev, next);
+      await settleOrQueue(syncArrayToCollection(db, path, prev, next), notify, name, false);
     } catch (e) {
       console.error("Save failed:", path, e);
       setter(prev);
@@ -1306,7 +1328,7 @@ function App() {
       }
 
       try {
-        await db.doc(docPath).set(cleanForStore(next));
+        await settleOrQueue(db.doc(docPath).set(cleanForStore(next)), notify, "settings");
       } catch (e) {
         console.error("Save failed:", docPath, e);
         setSettings(prevSettings);
@@ -1429,6 +1451,16 @@ function App() {
     const unsubscribers = [];
 
     LOCATION_COLLECTIONS.forEach((name) => {
+      if (name === "auditLogs") return; // written to, never displayed: not read, to save database reads
+      if (name === "attendance") {
+        const parts = {};
+        const merge = () => { if (!cancelled) setAttendance(sortNewestFirst(Array.from(new Map([...(parts.a || []), ...(parts.b || [])].map((r) => [r.id, r])).values()))); };
+        const col = getLocationCollection(db, locationId, "attendance");
+        const cutoff = todayStr(new Date(Date.now() - attDays * 86400000));
+        unsubscribers.push(col.where("date", ">=", cutoff).onSnapshot((snap) => { parts.a = snap.docs.map((d) => ({ ...d.data(), id: d.id })); merge(); }, (err) => onReadError("attendance", err)));
+        unsubscribers.push(col.where("status", "==", "INSIDE").onSnapshot((snap) => { parts.b = snap.docs.map((d) => ({ ...d.data(), id: d.id })); merge(); }, (err) => onReadError("attendance", err)));
+        return;
+      }
       unsubscribers.push(
         getLocationCollection(db, locationId, name).onSnapshot(
           (snap) => {
@@ -1456,7 +1488,7 @@ function App() {
         try { unsubscribe(); } catch (e) { /* ignore */ }
       });
     };
-  }, [session, activeLocationId]);
+  }, [session, activeLocationId, attDays]);
 
   // Broken seals for the dashboard (Loading Area only).
   useEffect(() => {
@@ -1647,7 +1679,7 @@ function getLocationCollection(db, locationId, collectionName) {
           />
         )}
         {view === "history" && (
-          <HistoryScreen employees={employees} attendance={attendance} empById={empById} session={session} settings={settings}
+          <HistoryScreen attDays={attDays} onMoreHistory={() => setAttDays((d) => d + 120)} employees={employees} attendance={attendance} empById={empById} session={session} settings={settings}
             persistAttendance={persist.attendance} audit={audit} persistAudit={persist.audit} notify={notify} />
         )}
         {view === "leave" && (
@@ -1690,7 +1722,7 @@ function getLocationCollection(db, locationId, collectionName) {
           <EmployeesScreen employees={employees} persistEmployees={persist.employees} notify={notify} canEdit={session.role === "admin" && activeLocationId !== ALL_LOC} />
         )}
         {view === "reports" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
-          <ReportsScreen employees={employees} attendance={attendance} empById={empById} settings={settings} />
+          <ReportsScreen attDays={attDays} onMoreHistory={() => setAttDays((d) => d + 120)} employees={employees} attendance={attendance} empById={empById} settings={settings} />
         )}
         {view === "settings" && session.role === "admin" && (
           <SettingsScreen settings={settings} persistSettings={persist.settings} users={users}
@@ -1743,6 +1775,30 @@ function getLocationCollection(db, locationId, collectionName) {
    Aramex-branded top bar (red wordmark + "Gatehouse Register" subtitle)
    with a bottom tab bar, icon + name on every tab.
 --------------------------------------------------------------------- */
+function SyncBadge() {
+  const [n, setN] = useState(WRITES.n);
+  const [on, setOn] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  useEffect(() => {
+    const f = () => setN(WRITES.n);
+    const up = () => setOn(true), down = () => setOn(false);
+    WRITES.subs.add(f);
+    window.addEventListener("online", up); window.addEventListener("offline", down);
+    return () => { WRITES.subs.delete(f); window.removeEventListener("online", up); window.removeEventListener("offline", down); };
+  }, []);
+  if (on && n === 0) return null;
+  return <span role="status" style={{ fontFamily: FONT_MONO, fontSize: 10, fontWeight: 700, color: "#fff", background: on ? "rgba(255,255,255,0.22)" : "#B45309", borderRadius: 10, padding: "3px 8px", whiteSpace: "nowrap" }}>{on ? "ONLINE" : "OFFLINE"}{n > 0 ? ` · ${n} WAITING TO UPLOAD` : ""}</span>;
+}
+
+function AttWindowNote({ days, onMore }) {
+  if (!onMore) return null;
+  return (
+    <div className="no-print" style={{ background: "#EFF6FF", border: "1px solid #BFDBFE", borderRadius: 8, padding: "8px 12px", fontSize: 12.5, color: C.ink, marginBottom: 12, display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+      <span>Showing the last {days} days of attendance (keeps the app fast and within the free data limits).</span>
+      <Btn size="sm" tone="paper" onClick={onMore}>Load 120 more days</Btn>
+    </div>
+  );
+}
+
 function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId, onLocationChange, vw }) {
   const dotColor = syncMode === "firebase" ? "#10B981" : syncMode === "synced" ? (canWriteShared === false ? C.amberDeep : "#10B981") : C.ink50;
   const syncLabel = syncMode === "firebase" ? "Synced via Firebase" : syncMode === "synced" ? (canWriteShared === false ? "Synced · read-only" : "Synced across devices") : "Local device only";
@@ -1765,6 +1821,7 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
           {loc}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <SyncBadge />
           {vw >= 1024 && <span style={{ fontFamily: FONT_MONO, fontSize: 10, color: "rgba(255,255,255,0.8)", display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: dotColor, display: "inline-block" }} />{syncLabel.toUpperCase()}</span>}
           <div style={{ width: 36, height: 36, borderRadius: "50%", background: "rgba(255,255,255,0.18)", display: "flex", alignItems: "center", justifyContent: "center" }}><Users size={18} color="#fff" /></div>
           <div style={{ textAlign: "left" }}>
@@ -1813,6 +1870,7 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
           )}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <SyncBadge />
           <div style={{ width: 38, height: 38, borderRadius: "50%", background: "rgba(255,255,255,0.18)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
             <Users size={18} color="#fff" />
           </div>
@@ -2955,7 +3013,7 @@ function AttendanceToday({ employees, attendance, empById, today, settings, leav
 /* ---------------------------------------------------------------------
    HISTORY
 --------------------------------------------------------------------- */
-function HistoryScreen({ employees, attendance, empById, session, persistAttendance, audit, persistAudit, notify, settings }) {
+function HistoryScreen({ employees, attendance, empById, session, persistAttendance, audit, persistAudit, notify, settings, attDays, onMoreHistory }) {
   const [filters, setFilters] = useState({ dateFrom: "", dateTo: "", employee: "", company: "", department: "", guard: "", status: "" });
   const [sortBy, setSortBy] = useState("latest");
   const [editing, setEditing] = useState(null);
@@ -3011,6 +3069,7 @@ function HistoryScreen({ employees, attendance, empById, session, persistAttenda
   return (
     <div>
       <SectionTitle title="Attendance History" sub={`${filtered.length} record(s)`} />
+      <AttWindowNote days={attDays} onMore={onMoreHistory} />
 
       <details style={{ marginBottom: 14, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: "10px 14px" }}>
         <summary style={{ cursor: "pointer", fontWeight: 600, fontSize: 13.5, color: C.navy }}>Filters &amp; Sort</summary>
@@ -3765,8 +3824,8 @@ function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
       date: todayStr(now), time: nowTimeStr(now), recorded_by: session.name, recorded_by_id: session.id, created_at: Date.now(),
     };
     try {
-      if (photoDataUrl) await db.doc(`${base}/loadingPhotos/${id}`).set({ id, log_id: id, image: photoDataUrl, created_at: rec.created_at });
-      await db.doc(`${base}/loadingLogs/${id}`).set(cleanForStore(rec));
+      if (photoDataUrl) await settleOrQueue(db.doc(`${base}/loadingPhotos/${id}`).set({ id, log_id: id, image: photoDataUrl, created_at: rec.created_at }), notify, "seal photo");
+      await settleOrQueue(db.doc(`${base}/loadingLogs/${id}`).set(cleanForStore(rec)), notify, "seal record");
     } catch (e) {
       console.error("Seal register save failed:", e);
       notify(describeFirestoreError(e, "save this record"), "error");
@@ -4236,18 +4295,18 @@ function HseInspectForm({ checklist, session, loc, getDb, notify, doneShifts, on
         if (result === "FAIL") {
           for (const image of (a.photos || [])) {
             const pid = uid("hp_");
-            await db.doc(`${base}/hsePhotos/${pid}`).set({ id: pid, inspection_id: id, item_id: it.id, image, created_at: Date.now() });
+            await settleOrQueue(db.doc(`${base}/hsePhotos/${pid}`).set({ id: pid, inspection_id: id, item_id: it.id, image, created_at: Date.now() }), notify, "inspection photo");
             photo_ids.push(pid);
           }
         }
         built.push({ item_id: it.id, category: it.category, question: it.question, mandatory: !!it.mandatory, result, skipped: !a.result, description: result === "FAIL" ? String(a.description).trim() : "", photo_ids });
       }
       const cnt = (r) => built.filter((x) => x.result === r).length;
-      await db.doc(`${base}/hseInspections/${id}`).set({
+      await settleOrQueue(db.doc(`${base}/hseInspections/${id}`).set({
         date: todayStr(now), time: nowTimeStr(now), shift, guard_name: session.name, guard_uid: session.id, checklist_id: checklist.id, checklist_version: checklist.version,
         items: built, pass_count: cnt("PASS"), fail_count: cnt("FAIL"), na_count: cnt("NA"), has_fail: cnt("FAIL") > 0, status: "SUBMITTED",
         submitted_at: window.firebase.firestore.FieldValue.serverTimestamp(), created_at: Date.now(),
-      });
+      }), notify, "inspection");
       notify(cnt("FAIL") ? `Inspection submitted — ${cnt("FAIL")} problem(s) reported to HSE` : "Inspection submitted — all clear");
       onDone();
     } catch (e) { console.error(e); setErr(describeFirestoreError(e, "submit the inspection")); setSaving(false); }
@@ -7107,11 +7166,12 @@ function BulkAddModal({ employees, onClose, onAdd }) {
 /* ---------------------------------------------------------------------
    REPORTS (admin)
 --------------------------------------------------------------------- */
-function ReportsScreen({ employees, attendance, empById, settings }) {
+function ReportsScreen({ employees, attendance, empById, settings, attDays, onMoreHistory }) {
   const [tab, setTab] = useState("daily");
   return (
     <div>
       <SectionTitle title="Reports" />
+      <AttWindowNote days={attDays} onMore={onMoreHistory} />
       <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
         {[["daily", "Daily"], ["weekly", "Weekly"], ["monthly", "Monthly"], ["employee", "Employee"]].map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)} style={{
