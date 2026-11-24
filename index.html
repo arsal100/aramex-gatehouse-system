@@ -1640,6 +1640,9 @@ function getLocationCollection(db, locationId, collectionName) {
   if (!session) {
   return <LoginScreen authError={firebaseError} onClearAuthError={() => setFirebaseError("")} notify={notify} />;
   }
+  // Phone only: Supervisors get the workforce-first dashboard; Managers get the security-operations-first one.
+  // Desktop is unchanged (Supervisor keeps its own, Managers keep the standard one).
+  const opsDash = session.role === "supervisor" ? vw >= 640 : (["manager", "security_manager"].includes(session.role) && vw < 640);
   return (
     <div style={{ minHeight: "100vh", background: C.paper, fontFamily: FONT_SANS, paddingBottom: vw >= 640 ? 0 : 76, paddingLeft: vw >= 1024 ? 220 : vw >= 640 ? 76 : 0 }}>
       <style>{`
@@ -1680,10 +1683,10 @@ function getLocationCollection(db, locationId, collectionName) {
         </div>
       )}
       <main style={{ maxWidth: vw >= 1024 ? 1440 : 1100, margin: "0 auto", padding: vw >= 1024 ? "24px 32px 40px" : "18px 16px 30px" }}>
-        {view === "dashboard" && session.role === "supervisor" && (
+        {view === "dashboard" && opsDash && (
           <SupervisorDashboard session={session} employees={employees} attendance={attendance} settings={settings} empById={empById} today={today} goto={setView} leaves={leaves} stockItems={stockItems} stockMovements={stockMovements} visitors={visitors} handoverRecords={handoverRecords} incidents={incidents} shipments={shipments} activeLocationId={activeLocationId} getDb={() => dbApiRef.current} vw={vw} />
         )}
-        {view === "dashboard" && session.role !== "supervisor" && (
+        {view === "dashboard" && !opsDash && (
           <Dashboard
             session={session} employees={employees} attendance={attendance} settings={settings}
             empById={empById} today={today} goto={setView} sendReport={sendReport} leaves={leaves}
