@@ -138,6 +138,7 @@ const FONT_MONO = "'JetBrains Mono', 'SF Mono', Consolas, monospace";
 /* ---------------------------------------------------------------------
    PURE HELPERS
 --------------------------------------------------------------------- */
+const isGuardOps = (x) => !!x && (x.role === "admin" || x.role === "guard");
 const isViewer = (x) => !!x && (x.role === "manager" || x.role === "security_manager");
 const isMgmt = (x) => !!x && (x.role === "admin" || x.role === "supervisor");
 const LOADING_VIEWS = ["dashboard", "alerts", "hse", "visitors", "handover", "incidents", "sealreg", "settings"];
@@ -1408,7 +1409,7 @@ function App() {
   // Each guard adds their own entry to the roster of every location they work at.
   useEffect(() => {
     const db = dbApiRef.current;
-    if (dbModeRef.current !== "firebase" || !db || !session || !["guard","supervisor"].includes(session.role)) return;
+    if (dbModeRef.current !== "firebase" || !db || !session || session.role !== "guard") return;
 
     (session.locationIds || []).forEach((locationId) => {
       db.doc(`locations/${locationId}/roster/${session.id}`)
@@ -1569,6 +1570,32 @@ function getLocationCollection(db, locationId, collectionName) {
     .collection(collectionName);
 }
   
+  // Incident update: the incident change and its audit event are one atomic batch.
+  const updateIncident = async (incident, patch, action, note) => {
+    const db = dbApiRef.current, loc = activeLocationIdRef.current;
+    if (!db || !loc || loc === ALL_LOC) throw new Error("Choose a single location to update an incident.");
+    if (!session || isViewer(session)) throw new Error("Read-only access.");
+    const ts = () => window.firebase.firestore.FieldValue.serverTimestamp();
+    const evId = uid("ie_"), b = db.batch();
+    b.update(db.doc(`locations/${loc}/incidents/${incident.id}`), { ...patch, updated_at: Date.now(), last_event_id: evId });
+    b.set(db.doc(`locations/${loc}/incidentEvents/${evId}`), { incident_id: incident.id, action, from_status: incident.status, to_status: patch.status || incident.status, note: String(note || "Update").slice(0, 1900), by: session.name, by_uid: session.id, by_role: session.role, at: ts() });
+    await settleOrQueue(b.commit(), notify, "incident update");
+  };
+  // Stuck handover: reassign or cancel with a mandatory reason; the change and its audit event are one atomic batch.
+  const overrideHandover = async (record, mode, guardId, reason) => {
+    const db = dbApiRef.current, loc = activeLocationIdRef.current;
+    if (!db || !loc || loc === ALL_LOC || !session || !isMgmt(session)) throw new Error("Not allowed.");
+    const g = roster.find((r) => r.id === guardId);
+    if (mode === "REASSIGN" && (!g || g.role !== "guard")) throw new Error("Choose an active guard.");
+    const ts = () => window.firebase.firestore.FieldValue.serverTimestamp();
+    const evId = uid("he_"), b = db.batch();
+    const patch = mode === "CANCEL" ? { status: "CANCELLED" } : { incoming_uid: guardId, incoming_guard_expected: g.name };
+    b.update(db.doc(`locations/${loc}/handoverRecords/${record.id}`), { ...patch, updated_at: Date.now(), override_reason: reason, override_by: session.name, override_by_uid: session.id, override_at: ts(), last_event_id: evId });
+    b.set(db.doc(`locations/${loc}/handoverEvents/${evId}`), { handover_id: record.id, action: mode, reason, from_status: "PENDING", to_status: mode === "CANCEL" ? "CANCELLED" : "PENDING", from_incoming_uid: record.incoming_uid || "", to_incoming_uid: mode === "CANCEL" ? (record.incoming_uid || "") : guardId, by: session.name, by_uid: session.id, by_role: session.role, at: ts() });
+    await settleOrQueue(b.commit(), notify, "handover change");
+    notify(mode === "CANCEL" ? "Handover cancelled" : "Incoming guard reassigned");
+  };
+
   const empById = useMemo(() => Object.fromEntries(employees.map((e) => [e.id, e])), [employees]);
   const today = todayStr();
 
@@ -1652,21 +1679,24 @@ function getLocationCollection(db, locationId, collectionName) {
         </div>
       )}
       <main style={{ maxWidth: vw >= 1024 ? 1440 : 1100, margin: "0 auto", padding: vw >= 1024 ? "24px 32px 40px" : "18px 16px 30px" }}>
-        {view === "dashboard" && (
+        {view === "dashboard" && session.role === "supervisor" && (
+          <SupervisorDashboard session={session} employees={employees} attendance={attendance} settings={settings} empById={empById} today={today} goto={setView} leaves={leaves} stockItems={stockItems} stockMovements={stockMovements} visitors={visitors} handoverRecords={handoverRecords} incidents={incidents} shipments={shipments} activeLocationId={activeLocationId} getDb={() => dbApiRef.current} />
+        )}
+        {view === "dashboard" && session.role !== "supervisor" && (
           <Dashboard
             session={session} employees={employees} attendance={attendance} settings={settings}
             empById={empById} today={today} goto={setView} sendReport={sendReport} leaves={leaves}
             stockItems={stockItems} stockMovements={stockMovements} visitors={visitors} handoverRecords={handoverRecords} incidents={incidents} shipments={shipments} activeLocationId={activeLocationId} brokenSeals={brokenSeals} vw={vw}
           />
         )}
-        {view === "checkin" && (
+        {view === "checkin" && isGuardOps(session) && (
           <CheckInScreen
             session={session} employees={employees} attendance={attendance} settings={settings} leaves={leaves}
             persistAttendance={persist.attendance} audit={audit} persistAudit={persist.audit}
             notify={notify} today={today}
           />
         )}
-        {view === "checkout" && (
+        {view === "checkout" && isGuardOps(session) && (
           <CheckOutScreen
             session={session} employees={employees} attendance={attendance} settings={settings}
             persistAttendance={persist.attendance} audit={audit} persistAudit={persist.audit}
@@ -1699,7 +1729,7 @@ function getLocationCollection(db, locationId, collectionName) {
           <SealRegisterScreen session={session} getDb={() => dbApiRef.current} firebaseMode={dbModeRef.current === "firebase"} notify={notify} />
         )}
         {view === "handover" && (
-          <HandoverScreen session={session} users={users} roster={roster} handoverItems={handoverItems} handoverRecords={handoverRecords}
+          <HandoverScreen session={session} onOverride={overrideHandover} users={users} roster={roster} handoverItems={handoverItems} handoverRecords={handoverRecords}
             persistHandoverItems={persist.handoverItems} persistHandoverRecords={persist.handoverRecords}
             settings={settings} persistSettings={persist.settings} notify={notify} />
         )}
@@ -1709,7 +1739,7 @@ function getLocationCollection(db, locationId, collectionName) {
             getDb={() => dbApiRef.current} firebaseMode={dbModeRef.current === "firebase"} activeLocationId={activeLocationId} />
         )}
         {view === "incidents" && (
-          <IncidentsScreen session={session} incidents={incidents} persistIncidents={persist.incidents}
+          <IncidentsScreen session={session} onUpdateIncident={updateIncident} incidents={incidents} persistIncidents={persist.incidents}
             settings={settings} persistSettings={persist.settings} notify={notify} />
         )}
         {view === "hse" && (
@@ -1892,8 +1922,8 @@ function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
     { id: "dashboard", label: "Dashboard", icon: Home, roles: ["admin","supervisor","manager","security_manager","guard"] },
     { id: "alerts", label: "Alerts", icon: AlertTriangle, roles: ["admin","supervisor","manager","security_manager"] },
     { id: "hse", label: "HSE", icon: CheckCircle2, roles: ["admin","supervisor","manager","security_manager","guard","hse_manager"] },
-    { id: "checkin", label: "Check In", icon: DoorOpen, roles: ["admin","supervisor","guard"] },
-    { id: "checkout", label: "Check Out", icon: DoorClosed, roles: ["admin","supervisor","guard"] },
+    { id: "checkin", label: "Check In", icon: DoorOpen, roles: ["admin","guard"] },
+    { id: "checkout", label: "Check Out", icon: DoorClosed, roles: ["admin","guard"] },
     { id: "attendance", label: "Today", icon: ClipboardList, roles: ["admin","supervisor","manager","security_manager","guard"] },
     { id: "history", label: "History", icon: CalendarDays, roles: ["admin","supervisor","manager","security_manager","guard"] },
     { id: "leave", label: "Leave", icon: UserX, roles: ["admin","supervisor","manager","security_manager","guard"] },
@@ -2266,7 +2296,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
         </div>
       )}
 
-      {(session.role === "guard" || session.role === "supervisor") && (
+      {session.role === "guard" && (
         <div style={{ background: "#fff", border: `2px solid ${C.aramexRed}`, borderRadius: 12, padding: "14px 16px", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
           <div><div style={{ fontWeight: 800, fontSize: 15 }}>Shift Handover</div><div style={{ fontSize: 12.5, color: C.ink50 }}>Ending your shift? Choose the incoming guard and complete the checklist.</div></div>
           <Btn tone="red" icon={RefreshCw} onClick={() => { window.__startHandover = true; goto("handover"); }}>Start Shift Handover</Btn>
@@ -2515,6 +2545,111 @@ function Donut({ parts, total }) {
   );
 }
 
+/* ---------------------------------------------------------------------
+   OPERATIONS SUPERVISOR: a monitoring dashboard of its own (not the guard dashboard).
+   It has no check-in, visitor or handover actions. Every card opens a view-only screen.
+--------------------------------------------------------------------- */
+function SupervisorDashboard({ session, employees, attendance, settings, empById, today, goto, leaves, stockItems, stockMovements, visitors, handoverRecords, incidents, shipments, activeLocationId, getDb }) {
+  const isAll = activeLocationId === ALL_LOC;
+  const nav = (v) => (isAll ? undefined : () => goto(v));
+  const [hse, setHse] = useState({ today: [], fails: [], actions: {} });
+  useEffect(() => {
+    const db = getDb();
+    if (!db || !activeLocationId || activeLocationId === ALL_LOC) { setHse({ today: [], fails: [], actions: {} }); return undefined; }
+    let off = false;
+    const stops = [];
+    const base = `locations/${activeLocationId}`;
+    const docs = (s) => s.docs.map((d) => ({ ...d.data(), id: d.id }));
+    const put = (k, v) => { if (!off) setHse((p) => ({ ...p, [k]: v })); };
+    stops.push(db.collection(`${base}/hseInspections`).where("date", "==", todayStr()).onSnapshot((s) => put("today", docs(s)), () => put("today", [])));
+    stops.push(db.collection(`${base}/hseInspections`).where("has_fail", "==", true).onSnapshot((s) => put("fails", docs(s)), () => put("fails", [])));
+    stops.push(db.collection(`${base}/hseAlertActions`).onSnapshot((s) => put("actions", Object.fromEntries(s.docs.map((d) => [d.id, d.data()]))), () => put("actions", {})));
+    return () => { off = true; stops.forEach((x) => { try { x(); } catch (e) { /* ignore */ } }); };
+  }, [activeLocationId]);
+
+  const todays = attendance.filter((a) => a.date === today);
+  const activeEmployees = employees.filter((e) => e.active);
+  const checkedInIds = new Set(todays.map((a) => a.employee_id));
+  const inside = todays.filter((a) => a.status === "INSIDE");
+  const onLeave = activeEmployees.filter((e) => findLeave(leaves, e.id, today));
+  const onLeaveIds = new Set(onLeave.map((e) => e.id));
+  const notIn = activeEmployees.filter((e) => !checkedInIds.has(e.id) && !onLeaveIds.has(e.id));
+  const shiftHours = settings.shift_hours || 9;
+  const overtime = todays.filter((a) => (a.status === "INSIDE" ? elapsedMinutes(a.date, a.time_in) > shiftHours * 60 : overtimeMinutes(a.total_minutes, shiftHours) > 0));
+  const openInc = (incidents || []).filter((i) => i.status === "Open" || i.status === "Under Investigation");
+  const serious = openInc.filter((i) => i.severity === "High" || i.severity === "Critical");
+  const hoHours = (settings.alerts && settings.alerts.pending_overdue_hours) || 2;
+  const pending = (handoverRecords || []).filter((r) => r.status === "PENDING");
+  const overdueHo = pending.filter((r) => Date.now() - (Number(r.created_at) || 0) > hoHours * 3600000);
+  const disc = (handoverRecords || []).filter((r) => r.has_discrepancy === true && r.status !== "CANCELLED");
+  const inWh = (shipments || []).filter((x) => x.status === "IN_WAREHOUSE");
+  const overdueShip = inWh.filter((x) => shipmentState(x, settings.shipment_threshold_days || 3) === "OVERDUE");
+  const damaged = inWh.filter((x) => x.damaged);
+  const low = (stockItems || []).filter((i) => i.active).map((i) => ({ ...i, level: stockLevel(i.id, stockMovements || []) })).filter((i) => i.level <= i.min_threshold);
+  const visitorsInside = (visitors || []).filter((v) => v.status === "INSIDE");
+  const doneShifts = hse.today.map((i) => i.shift);
+  const pendingShifts = ["Day", "Night"].filter((s) => !doneShifts.includes(s));
+  const failToday = hse.today.reduce((n, i) => n + (i.fail_count || 0), 0);
+  const openHse = hse.fails.flatMap((i) => (i.items || []).filter((it) => it.result === "FAIL").map((it) => (hse.actions[`${i.id}_${it.item_id}`] || {}).status || "NEW")).filter((st) => st !== "RESOLVED" && st !== "CLOSED").length;
+  const h = (v) => (isAll ? "—" : v);
+  const cards = [
+    { label: "Open Incidents", value: openInc.length, icon: AlertTriangle, from: "#1D4ED8", to: "#3B82F6", onClick: nav("incidents") },
+    { label: "High / Critical Incidents", value: serious.length, icon: AlertTriangle, from: "#B91C1C", to: "#EF4444", onClick: nav("incidents") },
+    { label: "Pending Handovers", value: pending.length, icon: RefreshCw, from: "#0F766E", to: "#14B8A6", onClick: nav("handover") },
+    { label: "Overdue Handovers", value: overdueHo.length, icon: Clock, from: "#C2410C", to: "#F97316", sub: `over ${hoHours}h`, onClick: nav("handover") },
+    { label: "Handover Discrepancies", value: disc.length, icon: RefreshCw, from: "#7C2D12", to: "#EA580C", sub: "flagged handovers", onClick: nav("handover") },
+    { label: "Damaged Shipments", value: damaged.length, icon: Package, from: "#9F1239", to: "#E11D48", sub: "in warehouse", onClick: nav("shipments") },
+    { label: "Overdue Shipments", value: overdueShip.length, icon: Truck, from: "#334155", to: "#64748B", onClick: nav("shipments") },
+    { label: "HSE Inspections Today", value: h(`${doneShifts.length} of 2`), icon: CheckCircle2, from: "#166534", to: "#22C55E", sub: isAll ? "choose a location" : (pendingShifts.length ? `pending: ${pendingShifts.join(" + ")}` : "both shifts done"), onClick: nav("hse") },
+    { label: "HSE Problems Today", value: h(failToday), icon: AlertTriangle, from: "#9A3412", to: "#F59E0B", sub: "FAIL items", onClick: nav("hse") },
+    { label: "Open HSE Alerts", value: h(openHse), icon: ShieldCheck, from: "#4C1D95", to: "#7C3AED", onClick: nav("hse") },
+  ];
+  const loc = (r) => r._loc || (isAll ? "" : activeLocationId);
+  const recent = [
+    ...(incidents || []).map((r) => ({ t: Number(r.created_at) || 0, cat: "Incident", text: `${r.severity} — ${r.type}`, status: r.status, loc: loc(r), hot: r.severity === "High" || r.severity === "Critical" })),
+    ...(handoverRecords || []).map((r) => ({ t: Number(r.created_at) || 0, cat: "Handover", text: `${r.outgoing_guard || ""} → ${r.incoming_guard_expected || ""}${r.has_discrepancy ? " (items missing)" : ""}`, status: r.status === "PENDING" ? "Pending" : r.status === "CANCELLED" ? "Cancelled" : "Completed", loc: loc(r), hot: !!r.has_discrepancy })),
+    ...(shipments || []).filter((r) => r.damaged).map((r) => ({ t: Number(r.created_at) || 0, cat: "Damaged shipment", text: `${shipRef(r)} — ${r.damage_notes || "damage reported"}`, status: r.status === "IN_WAREHOUSE" ? "In warehouse" : "Released", loc: loc(r), hot: true })),
+    ...hse.today.map((r) => ({ t: Number(r.created_at) || 0, cat: "HSE inspection", text: `${r.shift} shift — ${r.guard_name}: ${r.fail_count ? r.fail_count + " problem(s)" : "all clear"}`, status: r.has_fail ? "Problems" : "All clear", loc: activeLocationId, hot: !!r.has_fail })),
+  ].filter((x) => x.t).sort((a, b) => b.t - a.t).slice(0, 8);
+
+  return (
+    <div>
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ fontFamily: FONT_SERIF, fontSize: 22, fontWeight: 800, color: C.ink }}>Monitoring Dashboard</div>
+        <div style={{ fontSize: 12.5, color: C.ink50 }}>Operations Supervisor · {isAll ? "all your locations (choose one for HSE details)" : activeLocationId}</div>
+      </div>
+      <SectionTitle title="Security Operations Overview" />
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 12, marginBottom: 22 }}>
+        {cards.map((k) => <KpiCard key={k.label} {...k} />)}
+      </div>
+      <SectionTitle title="Attendance & Workforce" sub="Monitoring only — check-in and check-out are done by the guards" />
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12, marginBottom: 16 }}>
+        <StatCard label="Total Employees" value={activeEmployees.length} icon={Users} tone="red" onClick={() => goto("employees")} />
+        <StatCard label="Checked In Today" value={checkedInIds.size} icon={CalendarDays} tone="teal" onClick={() => goto("attendance")} />
+        <StatCard label="Currently Inside" value={inside.length} icon={Clock} tone="amber" onClick={() => goto("attendance")} />
+        <StatCard label="Not Checked In" value={notIn.length} icon={XCircle} tone="red" onClick={() => goto("attendance")} />
+        <StatCard label="On Leave Today" value={onLeave.length} icon={UserX} tone="slate" onClick={nav("leave")} />
+        <StatCard label="In Overtime" value={overtime.length} icon={AlertTriangle} tone="amber" onClick={() => goto("attendance")} />
+        <StatCard label="Visitors / Contractors Inside" value={visitorsInside.length} icon={UserPlus} tone="purple" onClick={nav("visitors")} />
+        <StatCard label="Low Stock Items" value={low.length} icon={Package} tone="slate" onClick={nav("inventory")} />
+        <StatCard label="Shipments in Warehouse" value={inWh.length} icon={Truck} tone="teal" onClick={nav("shipments")} />
+      </div>
+      <SectionTitle title="Recent Activity" sub="Latest real records" action={{ label: "View all alerts", onClick: () => goto("alerts") }} />
+      <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 16, overflow: "hidden", marginBottom: 22 }}>
+        {recent.length === 0 ? <EmptyState icon={ClipboardList} title="No recent activity yet" /> : recent.map((r, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderBottom: i < recent.length - 1 ? `1px solid ${C.line}` : "none", background: r.hot ? "#FEF7F7" : "#fff" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13.5, fontWeight: r.hot ? 700 : 500, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.text}</div>
+              <div style={{ fontSize: 11.5, color: C.ink50 }}>{r.cat}{r.loc ? ` · ${r.loc}` : ""} · {r.status}</div>
+            </div>
+            <div style={{ fontSize: 11.5, color: C.ink50, flexShrink: 0 }}>{dubaiStamp(r.t)}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function StatusBadge({ a, shiftHours }) {
   const sh = shiftHours || 9;
   if (a.status === "INSIDE") {
@@ -2612,7 +2747,7 @@ function CheckInScreen({ session, employees, attendance, settings, leaves, persi
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState(null);
   // Only admins may record a past date/time. Everyone else is always stamped with the current time.
-  const canBackdate = isMgmt(session);
+  const canBackdate = session.role === "admin";
   const [backdate, setBackdateRaw] = useState(false);
   const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
@@ -2833,7 +2968,7 @@ function CheckOutScreen({ session, employees, attendance, settings, persistAtten
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState(null);
   // Only admins may record a past date/time. Everyone else is always stamped with the current time.
-  const canBackdate = isMgmt(session);
+  const canBackdate = session.role === "admin";
   const [backdate, setBackdateRaw] = useState(false);
   const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
@@ -3121,7 +3256,7 @@ function HistoryScreen({ employees, attendance, empById, session, persistAttenda
                 <Td><StatusBadge a={r} shiftHours={settings.shift_hours} /></Td>
                 <Td>{r.status === "INSIDE" ? r.checked_in_by : r.checked_out_by}</Td>
                 <Td>{[r.remarks_in, r.remarks_out].filter(Boolean).join(" / ") || "—"}</Td>
-                <Td>{isMgmt(session) && (
+                <Td>{session.role === "admin" && (
                   <button onClick={() => setEditing(r)} style={{ background: "none", border: "none", color: C.navy, cursor: "pointer" }} title="Correct record"><Edit3 size={15} /></button>
                 )}</Td>
               </tr>
@@ -3236,7 +3371,7 @@ function VisitorsScreen({ session, visitors, persistVisitors, notify, today }) {
 
   return (
     <div>
-      <SectionTitle title="Visitors & Contractors" sub={`${inside.length} currently inside`} action={{ label: "+ Log In", onClick: () => setShowForm(true) }} />
+      <SectionTitle title="Visitors & Contractors" sub={`${inside.length} currently inside`} action={isGuardOps(session) ? { label: "+ Log In", onClick: () => setShowForm(true) } : undefined} />
 
       <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
         {[["inside", `Inside (${inside.length})`], ["history", "History"]].map(([k, label]) => (
@@ -3282,7 +3417,7 @@ function VisitorsScreen({ session, visitors, persistVisitors, notify, today }) {
                   </div>
                   {v.remarks && <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 3 }}>Note: {v.remarks}</div>}
                 </div>
-                {v.status === "INSIDE" && (
+                {isGuardOps(session) && v.status === "INSIDE" && (
                   <Btn size="sm" tone="red" icon={DoorClosed} onClick={() => checkOut(v)}>Check Out</Btn>
                 )}
               </div>
@@ -3457,10 +3592,10 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
                     <button onClick={() => setEditingItem(i)} style={{ background: "none", border: "none", color: C.navy, cursor: "pointer" }}><Edit3 size={15} /></button>
                   )}
                 </div>
-                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                {isGuardOps(session) && (<div style={{ display: "flex", gap: 8, marginTop: 10 }}>
                   <Btn size="sm" tone="green" icon={DoorOpen} onClick={() => setShowMoveForm({ item: i, type: "IN" })}>Stock In</Btn>
                   <Btn size="sm" tone="red" icon={DoorClosed} onClick={() => setShowMoveForm({ item: i, type: "OUT" })}>Stock Out</Btn>
-                </div>
+                </div>)}
               </div>
             ))
           )}
@@ -3494,7 +3629,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
           onToggleActive={() => { toggleItemActive(editingItem); setEditingItem(null); }} />
       )}
       {showMoveForm && (
-        <StockMovementForm item={showMoveForm.item} type={showMoveForm.type} onClose={() => setShowMoveForm(null)} onSave={logMovement} canBackdate={isMgmt(session)} />
+        <StockMovementForm item={showMoveForm.item} type={showMoveForm.type} onClose={() => setShowMoveForm(null)} onSave={logMovement} canBackdate={session.role === "admin"} />
       )}
     </div>
   );
@@ -3900,10 +4035,10 @@ function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
       <SectionTitle title="Seal Register" sub={`${SEAL_LOCATION_ID} · vehicles IN and OUT`} />
       <SealTabs tab={tab} setTab={setTab} canReport={canReport} />
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+      {isGuardOps(session) && (<div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
         <Btn tone="green" size="lg" icon={DoorOpen} onClick={() => setShowForm("IN")}>Vehicle IN</Btn>
         <Btn tone="navy" size="lg" icon={DoorClosed} onClick={() => setShowForm("OUT")}>Vehicle OUT</Btn>
-      </div>
+      </div>)}
       {inside.length > 0 && (
         <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
           <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Vehicles inside now ({inside.length})</div>
@@ -4398,7 +4533,7 @@ function HseChecklistAdmin({ active, latest, loc, session, getDb, notify }) {
 
 function HSEScreen({ session, getDb, locationId, notify }) {
   const role = session.role;
-  const canInspect = ["guard", "supervisor", "admin"].includes(role);
+  const canInspect = ["guard", "admin"].includes(role);
   const canAlerts = ["admin", "hse_manager", "security_manager", "supervisor", "manager"].includes(role);
   const canTriage = role === "admin" || role === "hse_manager";
   const [tab, setTab] = useState(canInspect ? "inspect" : "overview");
@@ -4992,12 +5127,13 @@ function StockMovementForm({ item, type, onClose, onSave, canBackdate }) {
    Anything missing is flagged immediately and can be emailed straight to
    a manager rather than waiting for a scheduled report.
 --------------------------------------------------------------------- */
-function HandoverScreen({ session, users, roster, handoverItems, handoverRecords, persistHandoverItems, persistHandoverRecords, settings, persistSettings, notify }) {
+function HandoverScreen({ session, users, roster, handoverItems, handoverRecords, persistHandoverItems, persistHandoverRecords, settings, persistSettings, notify, onOverride }) {
   const hoTab = useRef((() => { const v = window.__hoIntent; window.__hoIntent = undefined; return v || "current"; })()).current;
   const [tab, setTab] = useState(hoTab);
   const [showStart, setShowStart] = useState(false);
   const [takingOver, setTakingOver] = useState(null);
   const [managingItems, setManagingItems] = useState(false);
+  const [override, setOverride] = useState(null);
   useEffect(() => { if (window.__startHandover) { window.__startHandover = false; setShowStart(true); } }, []);
 
   const pending = handoverRecords.find((r) => r.status === "PENDING");
@@ -5088,7 +5224,13 @@ function HandoverScreen({ session, users, roster, handoverItems, handoverRecords
                   <Btn size="sm" tone="red" onClick={() => sendMissingAlert(pending)}>Alert Manager</Btn>
                 </div>
               )}
-              {pending.incoming_uid === session.id ? <Btn full tone="amber" icon={RefreshCw} onClick={() => setTakingOver(pending)}>Take Over Shift</Btn> : <div style={{ fontSize: 12.5, color: C.ink50 }}>Waiting for {pending.incoming_guard_expected || "the assigned guard"} to take over.</div>}
+              {pending.incoming_uid === session.id && isGuardOps(session) ? <Btn full tone="amber" icon={RefreshCw} onClick={() => setTakingOver(pending)}>Take Over Shift</Btn> : <div style={{ fontSize: 12.5, color: C.ink50 }}>Waiting for {pending.incoming_guard_expected || "the assigned guard"} to take over.</div>}
+              {isMgmt(session) && onOverride && (
+                <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                  <Btn size="sm" tone="paper" onClick={() => setOverride({ record: pending, mode: "REASSIGN" })}>Reassign incoming guard</Btn>
+                  <Btn size="sm" tone="red" onClick={() => setOverride({ record: pending, mode: "CANCEL" })}>Cancel handover</Btn>
+                </div>
+              )}
             </div>
           ) : (
             <div style={{ marginBottom: 16 }}>
@@ -5096,9 +5238,9 @@ function HandoverScreen({ session, users, roster, handoverItems, handoverRecords
             </div>
           )}
 
-          <Btn full tone="navy" icon={DoorOpen} onClick={() => setShowStart(true)} disabled={!!pending || isViewer(session)}>
+          {isGuardOps(session) && (<Btn full tone="navy" icon={DoorOpen} onClick={() => setShowStart(true)} disabled={!!pending || isViewer(session)}>
             {pending ? "Complete the pending takeover first" : "+ Start Handover (End of My Shift)"}
-          </Btn>
+          </Btn>)}
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -5122,11 +5264,43 @@ function HandoverScreen({ session, users, roster, handoverItems, handoverRecords
 
       {showStart && <HandoverForm items={activeItems} users={users} roster={roster} session={session} onClose={() => setShowStart(false)} onSave={startHandover} />}
       {takingOver && <TakeoverForm record={takingOver} onClose={() => setTakingOver(null)} onConfirm={completeTakeover} />}
+      {override && <HandoverOverrideModal record={override.record} mode={override.mode} roster={roster} onClose={() => setOverride(null)} onSubmit={onOverride} />}
       {managingItems && (
         <HandoverItemsManager items={handoverItems} persistItems={persistHandoverItems}
           settings={settings} persistSettings={persistSettings} notify={notify} onClose={() => setManagingItems(false)} />
       )}
     </div>
+  );
+}
+
+function HandoverOverrideModal({ record, mode, roster, onClose, onSubmit }) {
+  const [guard, setGuard] = useState("");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const options = (roster || []).filter((r) => r.role === "guard" && r.active !== false && r.id !== record.outgoing_uid && r.id !== record.incoming_uid);
+  const go = async () => {
+    if (!reason.trim()) { setErr("A reason is required."); return; }
+    if (mode === "REASSIGN" && !guard) { setErr("Choose the new incoming guard."); return; }
+    setBusy(true); setErr("");
+    try { await onSubmit(record, mode, guard, reason.trim()); onClose(); }
+    catch (e) { console.error(e); setBusy(false); setErr("Could not save. The handover may have changed, or the new guard is not an active guard at this location."); }
+  };
+  return (
+    <Modal title={mode === "CANCEL" ? "Cancel pending handover" : "Reassign incoming guard"} onClose={onClose}>
+      <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 10 }}>From {record.outgoing_guard} to {record.incoming_guard_expected || "—"}, waiting since {fmtTime(record.time_out)}. This is recorded in the audit history.</div>
+      {mode === "REASSIGN" && (
+        <Field label="New incoming guard">
+          <select style={inputStyle} value={guard} onChange={(e) => setGuard(e.target.value)}>
+            <option value="">Select…</option>
+            {options.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+          </select>
+        </Field>
+      )}
+      <Field label="Reason (required)"><textarea style={{ ...inputStyle, minHeight: 60 }} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Incoming guard is absent" /></Field>
+      {err && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 12.5, color: C.redDeep, marginBottom: 10 }}>{err}</div>}
+      <Btn full tone={mode === "CANCEL" ? "red" : "navy"} onClick={go} disabled={busy}>{busy ? "Saving…" : mode === "CANCEL" ? "Cancel handover" : "Reassign"}</Btn>
+    </Modal>
   );
 }
 
@@ -5138,7 +5312,7 @@ function HandoverForm({ items, users, roster, session, onClose, onSave }) {
   const OTHER = "__other__";
 
   // Guards from the old accounts list plus the location roster (Firebase mode), without duplicates or yourself.
-  const guardOptions = (roster || []).filter((r) => r.active !== false && r.name && r.id !== session.id).sort((a, b) => a.name.localeCompare(b.name));
+  const guardOptions = (roster || []).filter((r) => r.active !== false && r.name && r.id !== session.id && r.role === "guard").sort((a, b) => a.name.localeCompare(b.name));
   const guardNames = guardOptions.map((g) => g.name);
 
   const chosenGuard = (guardOptions.find((g) => g.id === incomingGuard) || {}).name || "";
@@ -5315,7 +5489,7 @@ function severityTone(sev) {
   return "neutral";
 }
 
-function IncidentsScreen({ session, incidents, persistIncidents, settings, persistSettings, notify }) {
+function IncidentsScreen({ session, incidents, persistIncidents, settings, persistSettings, notify, onUpdateIncident }) {
   const sevIntent = useRef((() => { const v = window.__incFilter; window.__incFilter = undefined; return v || ""; })()).current;
   const [sevFilter, setSevFilter] = useState(sevIntent);
   const [tab, setTab] = useState("open");
@@ -5339,15 +5513,11 @@ function IncidentsScreen({ session, incidents, persistIncidents, settings, persi
     notify("Incident reported");
   };
 
-  const updateStatus = async (incident, status, resolutionNotes) => {
-    const updated = {
-      ...incident, status, updated_at: Date.now(),
-      resolution_notes: resolutionNotes != null ? resolutionNotes : incident.resolution_notes,
-      resolved_by: (status === "Resolved" || status === "Closed") ? session.name : incident.resolved_by,
-    };
-    await persistIncidents(incidents.map((i) => (i.id === incident.id ? updated : i)));
-    setViewing(updated);
-    notify("Incident updated");
+  const saveUpdate = async (incident, patch, action, note) => {
+    const p = { ...patch };
+    if ((p.status === "Resolved" || p.status === "Closed") && incident.status !== p.status) p.resolved_by = session.name;
+    try { await onUpdateIncident(incident, p, action, note); setViewing({ ...incident, ...p, updated_at: Date.now() }); notify("Incident updated"); }
+    catch (e) { console.error(e); notify(describeFirestoreError(e, "update the incident"), "error"); }
   };
 
   const sendAlert = async (incident) => {
@@ -5370,7 +5540,7 @@ function IncidentsScreen({ session, incidents, persistIncidents, settings, persi
 
   return (
     <div>
-      <SectionTitle title="Incident Reports" sub={`${open.length} open`} action={{ label: "+ Report Incident", onClick: () => setShowForm(true) }} />
+      <SectionTitle title="Incident Reports" sub={`${open.length} open`} action={isGuardOps(session) ? { label: "+ Report Incident", onClick: () => setShowForm(true) } : undefined} />
       {session.role === "admin" && (
         <button onClick={() => setAlertSettings(true)} style={{ background: "none", border: "none", color: C.navy, fontSize: 12, fontWeight: 600, cursor: "pointer", textDecoration: "underline", marginBottom: 12, display: "block" }}>
           Alert Settings
@@ -5411,7 +5581,7 @@ function IncidentsScreen({ session, incidents, persistIncidents, settings, persi
 
       {showForm && <IncidentForm onClose={() => setShowForm(false)} onSave={report} />}
       {viewing && (
-        <IncidentDetailModal incident={viewing} onClose={() => setViewing(null)} onUpdateStatus={updateStatus} onAlert={sendAlert} />
+        <IncidentDetailModal incident={viewing} onClose={() => setViewing(null)} onUpdate={saveUpdate} canUpdate={!isViewer(session)} onAlert={sendAlert} />
       )}
       {alertSettings && (
         <IncidentAlertSettings settings={settings} persistSettings={persistSettings} notify={notify} onClose={() => setAlertSettings(false)} />
@@ -5459,9 +5629,12 @@ function IncidentForm({ onClose, onSave }) {
   );
 }
 
-function IncidentDetailModal({ incident, onClose, onUpdateStatus, onAlert }) {
-  const [notes, setNotes] = useState(incident.resolution_notes || "");
-
+function IncidentDetailModal({ incident, onClose, onUpdate, onAlert, canUpdate }) {
+  const [inv, setInv] = useState(incident.investigation_notes || "");
+  const [res, setRes] = useState(incident.resolution_notes || "");
+  const [busy, setBusy] = useState(false);
+  const changed = inv !== (incident.investigation_notes || "") || res !== (incident.resolution_notes || "");
+  const run = async (patch, action, note) => { setBusy(true); try { await onUpdate(incident, patch, action, note); } finally { setBusy(false); } };
   return (
     <Modal title={incident.type} onClose={onClose} wide>
       <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
@@ -5475,7 +5648,7 @@ function IncidentDetailModal({ incident, onClose, onUpdateStatus, onAlert }) {
       {incident.people_involved && <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 6 }}>People involved: {incident.people_involved}</div>}
       {incident.action_taken && <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 6 }}>Action taken: {incident.action_taken}</div>}
 
-      {(incident.severity === "High" || incident.severity === "Critical") && incident.status !== "Closed" && (
+      {(incident.severity === "High" || incident.severity === "Critical") && incident.status !== "Closed" && onAlert && (
         <div style={{ background: "#FEE2E2", borderRadius: 8, padding: "9px 11px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
           <span style={{ fontSize: 12.5, color: C.redDeep, fontWeight: 600 }}>{incident.severity} severity — consider alerting a manager</span>
           <Btn size="sm" tone="red" onClick={() => onAlert(incident)}>Alert Manager</Btn>
@@ -5483,16 +5656,27 @@ function IncidentDetailModal({ incident, onClose, onUpdateStatus, onAlert }) {
       )}
 
       <div style={{ borderTop: `1px dashed ${C.line}`, paddingTop: 14 }}>
-        <Field label="Resolution notes"><textarea style={{ ...inputStyle, minHeight: 60 }} value={notes} onChange={(e) => setNotes(e.target.value)} /></Field>
-        <div style={{ fontSize: 12.5, fontWeight: 600, color: C.ink50, marginBottom: 8 }}>Update status</div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {INCIDENT_STATUSES.map((s) => (
-            <button key={s} type="button" onClick={() => onUpdateStatus(incident, s, notes)} style={{
-              padding: "7px 12px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
-              border: `1px solid ${incident.status === s ? C.navy : C.line}`, background: incident.status === s ? C.navy : "#fff", color: incident.status === s ? "#fff" : C.ink,
-            }}>{s}</button>
-          ))}
-        </div>
+        {canUpdate ? (
+          <>
+            <Field label="Investigation notes"><textarea style={{ ...inputStyle, minHeight: 56 }} value={inv} onChange={(e) => setInv(e.target.value)} /></Field>
+            <Field label="Resolution notes"><textarea style={{ ...inputStyle, minHeight: 56 }} value={res} onChange={(e) => setRes(e.target.value)} /></Field>
+            {changed && <div style={{ marginBottom: 12 }}><Btn size="sm" tone="navy" disabled={busy} onClick={() => run({ investigation_notes: inv, resolution_notes: res }, "NOTE", "Notes updated")}>Save notes</Btn></div>}
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: C.ink50, marginBottom: 8 }}>Update status (recorded in the audit history)</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {INCIDENT_STATUSES.map((s) => (
+                <button key={s} type="button" disabled={busy} onClick={() => { if (s !== incident.status) run({ status: s, investigation_notes: inv, resolution_notes: res }, "STATUS_CHANGE", `${incident.status} to ${s}`); }} style={{
+                  padding: "7px 12px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                  border: `1px solid ${incident.status === s ? C.navy : C.line}`, background: incident.status === s ? C.navy : "#fff", color: incident.status === s ? "#fff" : C.ink,
+                }}>{s}</button>
+              ))}
+            </div>
+          </>
+        ) : (
+          <>
+            {incident.investigation_notes && <div style={{ fontSize: 12.5, marginBottom: 6 }}><b>Investigation:</b> {incident.investigation_notes}</div>}
+            {incident.resolution_notes && <div style={{ fontSize: 12.5 }}><b>Resolution:</b> {incident.resolution_notes}</div>}
+          </>
+        )}
       </div>
     </Modal>
   );
@@ -5825,12 +6009,12 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
 
   return (
     <div>
-      <SectionTitle title="Shipments" sub={`${inWh.length} in warehouse${overdue.length ? ` · ${overdue.length} overdue` : ""}`} action={{ label: "+ Receive Shipment", onClick: () => setShowReceive(true) }} />
+      <SectionTitle title="Shipments" sub={`${inWh.length} in warehouse${overdue.length ? ` · ${overdue.length} overdue` : ""}`} action={isGuardOps(session) ? { label: "+ Receive Shipment", onClick: () => setShowReceive(true) } : undefined} />
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
-        <Btn size="sm" tone="navy" icon={Camera} onClick={() => setShowScan(true)}>Scan / Paste Manifest</Btn>
-        <Btn size="sm" tone="paper" icon={DoorOpen} onClick={() => setShowCount("IN")}>Receive by count</Btn>
-        <Btn size="sm" tone="paper" icon={DoorClosed} onClick={() => setShowCount("OUT")}>Release by count</Btn>
+        {isGuardOps(session) && <Btn size="sm" tone="navy" icon={Camera} onClick={() => setShowScan(true)}>Scan / Paste Manifest</Btn>}
+        {isGuardOps(session) && <Btn size="sm" tone="paper" icon={DoorOpen} onClick={() => setShowCount("IN")}>Receive by count</Btn>}
+        {isGuardOps(session) && <Btn size="sm" tone="paper" icon={DoorClosed} onClick={() => setShowCount("OUT")}>Release by count</Btn>}
         <Btn size="sm" tone="paper" icon={FileDown} onClick={() => sendReport("shipments", "daily")}>Send Day Report to Manager</Btn>
         <Btn size="sm" tone="paper" icon={FileDown} onClick={() => sendReport("shipments", "weekly")}>Send Week Report</Btn>
         <Btn size="sm" tone="paper" icon={FileDown} onClick={() => sendReport("shipments", "monthly")}>Send Month Report</Btn>
@@ -5999,9 +6183,9 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
                 </div>
                 {(s.status === "IN_WAREHOUSE" || (s.damaged && (s.photo_ids || []).length > 0)) && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
-                    {s.status === "IN_WAREHOUSE" && <Btn size="sm" tone="red" icon={DoorClosed} onClick={() => setReleasing(s)}>Release</Btn>}
-                    {s.status === "IN_WAREHOUSE" && <Btn size="sm" tone="paper" icon={Edit3} onClick={() => setNoting(s)}>Add reason</Btn>}
-                    {s.status === "IN_WAREHOUSE" && !s.damaged && <Btn size="sm" tone="paper" icon={AlertTriangle} onClick={() => setDamageFor(s)}>Report damage</Btn>}
+                    {isGuardOps(session) && s.status === "IN_WAREHOUSE" && <Btn size="sm" tone="red" icon={DoorClosed} onClick={() => setReleasing(s)}>Release</Btn>}
+                    {isGuardOps(session) && s.status === "IN_WAREHOUSE" && <Btn size="sm" tone="paper" icon={Edit3} onClick={() => setNoting(s)}>Add reason</Btn>}
+                    {isGuardOps(session) && s.status === "IN_WAREHOUSE" && !s.damaged && <Btn size="sm" tone="paper" icon={AlertTriangle} onClick={() => setDamageFor(s)}>Report damage</Btn>}
                     {s.damaged && (s.photo_ids || []).length > 0 && <Btn size="sm" tone="paper" icon={Eye} onClick={() => setPhotosOf(s)}>Photos ({(s.photo_ids || []).length})</Btn>}
                   </div>
                 )}
@@ -6011,13 +6195,13 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
         })}
       </div>
 
-      {showScan && <ManifestScanModal existing={shipments} custom={custom} onClose={() => setShowScan(false)} onSave={receiveBulk} canBackdate={isMgmt(session)} />}
-      {showReceive && <ShipmentReceiveForm existing={shipments} custom={custom} onClose={() => setShowReceive(false)} onSave={receive} canBackdate={isMgmt(session)}
+      {showScan && <ManifestScanModal existing={shipments} custom={custom} onClose={() => setShowScan(false)} onSave={receiveBulk} canBackdate={session.role === "admin"} />}
+      {showReceive && <ShipmentReceiveForm existing={shipments} custom={custom} onClose={() => setShowReceive(false)} onSave={receive} canBackdate={session.role === "admin"}
         photosEnabled={!!firebaseMode} onSwitchToCount={() => { setShowReceive(false); setShowCount("IN"); }} />}
-      {showCount && <ShipmentCountForm direction={showCount} custom={custom} onClose={() => setShowCount(null)} onSave={addCount} canBackdate={isMgmt(session)} />}
+      {showCount && <ShipmentCountForm direction={showCount} custom={custom} onClose={() => setShowCount(null)} onSave={addCount} canBackdate={session.role === "admin"} />}
       {damageFor && <ShipmentDamageModal shipment={damageFor} photosEnabled={!!firebaseMode} onClose={() => setDamageFor(null)} onSave={(d) => reportDamage(damageFor, d)} />}
       {photosOf && <ShipmentPhotosModal shipment={photosOf} getDb={getDb} base={photoBase()} onClose={() => setPhotosOf(null)} />}
-      {releasing && <ShipmentReleaseForm shipment={releasing} onClose={() => setReleasing(null)} onSave={(data) => release(releasing, data)} canBackdate={isMgmt(session)} />}
+      {releasing && <ShipmentReleaseForm shipment={releasing} onClose={() => setReleasing(null)} onSave={(data) => release(releasing, data)} canBackdate={session.role === "admin"} />}
       {noting && <ShipmentNoteModal shipment={noting} onClose={() => setNoting(null)} onSave={(text) => addNote(noting, text)} />}
       {showThreshold && <ShipmentThresholdModal settings={settings} persistSettings={persistSettings} notify={notify} onClose={() => setShowThreshold(false)} />}
       {showCodes && <ShipmentOriginCodesModal settings={settings} persistSettings={persistSettings} notify={notify} onClose={() => setShowCodes(false)} />}
