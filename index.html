@@ -287,11 +287,42 @@ function isReportDue(rd) {
   if (rd.frequency === "monthly") return rd.last_sent.slice(0, 7) !== today.slice(0, 7);
   return rd.last_sent !== today; // daily
 }
-function buildReportPayload(freq, employees, attendance, empById, settings) {
+// ---- Attendance reports: every active employee is accounted for, every day ----
+// An employee-day is PRESENT (an attendance record exists), or the leave type recorded for that day
+// (Annual Leave, Sick Leave, Day Off, Absent, Other), or NOT CHECKED IN (no record and no leave).
+function leaveStatusLabel(type) {
+  return { "Annual Leave": "ANNUAL LEAVE", "Sick Leave": "SICK LEAVE", "Day Off": "DAY OFF", "Absent": "ABSENT" }[type] || "OTHER LEAVE";
+}
+function daysBetween(from, to) {
+  const out = [];
+  const end = to < todayStr() ? to : todayStr(); // future days are not reported
+  for (let d = new Date(from + "T00:00:00"); todayStr(d) <= end; d.setDate(d.getDate() + 1)) out.push(todayStr(d));
+  return out;
+}
+function buildStatusRows(from, to, employees, attendance, leaves) {
+  const present = new Set(attendance.filter((a) => a.date >= from && a.date <= to).map((a) => a.employee_id + "|" + a.date));
+  const days = daysBetween(from, to);
+  const rows = [];
+  employees.filter((e) => e.active).forEach((e) => {
+    const joined = e.created_at ? todayStr(new Date(Number(e.created_at))) : "";
+    days.forEach((d) => {
+      if (joined && d < joined) return; // not counted before the employee was added
+      if (present.has(e.id + "|" + d)) return;
+      const lv = findLeave(leaves || [], e.id, d);
+      rows.push({ date: d, emp: e, day_status: lv ? leaveStatusLabel(lv.type) : "NOT CHECKED IN", day_reason: lv ? (lv.reason || lv.type) : "No attendance and no leave recorded" });
+    });
+  });
+  return rows;
+}
+const STATUS_CMP = (a, b) => b.date.localeCompare(a.date) || ((a.day_status ? 1 : 0) - (b.day_status ? 1 : 0)) || (a.day_status ? (a.day_status.localeCompare(b.day_status) || a.emp.name.localeCompare(b.emp.name)) : (b.time_in || "").localeCompare(a.time_in || ""));
+
+function buildReportPayload(freq, employees, attendance, empById, settings, leaves) {
   const shiftHours = (settings && settings.shift_hours) || 9;
   const { from, to, label } = getPeriodRange(freq);
   const rows = attendance.filter((a) => a.date >= from && a.date <= to).map((a) => ({ ...a, emp: empById[a.employee_id] })).filter((r) => r.emp);
   rows.sort((a, b) => (b.date + b.time_in).localeCompare(a.date + a.time_in));
+  const statusRows = buildStatusRows(from, to, employees, attendance, leaves);
+  const allRows = [...rows, ...statusRows].sort(STATUS_CMP);
   const inside = rows.filter((r) => r.status === "INSIDE").length;
   const overtimeTotal = rows.reduce((s, r) => s + overtimeMinutes(r.total_minutes, shiftHours), 0);
   const overtimeCount = rows.filter((r) => overtimeMinutes(r.total_minutes, shiftHours) > 0).length;
@@ -299,13 +330,29 @@ function buildReportPayload(freq, employees, attendance, empById, settings) {
   const activeCount = employees.filter((e) => e.active).length;
   const freqLabel = { daily: "Daily", weekly: "Weekly", monthly: "Monthly" }[freq] || "Attendance";
 
-  const subject = `${freqLabel} Gate Attendance Report — ${label}`;
+  const presentKeys = new Set(rows.map((r) => r.employee_id + "|" + r.date));
+  const stOrder = ["ANNUAL LEAVE", "SICK LEAVE", "DAY OFF", "ABSENT", "OTHER LEAVE", "NOT CHECKED IN"];
+  const stName = (st) => st.charAt(0) + st.slice(1).toLowerCase();
+  const stCount = (st) => statusRows.filter((r) => r.day_status === st).length;
+  const unit = freq === "daily" ? "" : " day(s)";
+  const summary = [
+    "Employee status:", `Active employees: ${activeCount}`, `Present: ${presentKeys.size}${unit}`,
+    ...stOrder.map((st) => `${stName(st)}: ${stCount(st)}${unit}`),
+    ...(freq === "daily" ? stOrder.filter((st) => stCount(st) > 0).map((st) => `- ${stName(st)}: ${statusRows.filter((r) => r.day_status === st).map((r) => r.emp.name).join(", ")}`) : []),
+    ...(freq !== "daily" ? ["Per employee (days):", ...employees.filter((e) => e.active).slice(0, 40).map((e) => {
+      const p = new Set(rows.filter((r) => r.employee_id === e.id).map((r) => r.date)).size;
+      const c = (st) => statusRows.filter((r) => r.emp.id === e.id && r.day_status === st).length;
+      return `- ${e.name}: present ${p}, annual leave ${c("ANNUAL LEAVE")}, sick ${c("SICK LEAVE")}, day off ${c("DAY OFF")}, absent ${c("ABSENT")}, other ${c("OTHER LEAVE")}, not checked in ${c("NOT CHECKED IN")}`;
+    })] : []),
+  ];
+  
+const subject = `${freqLabel} Gate Attendance Report — ${label}`;
   const lines = [
     `${freqLabel} Gate Attendance Report`, `Period: ${label}`, "",
     `Total active employees: ${activeCount}`, `Attendance records: ${rows.length}`,
     `Currently inside: ${inside}`, `Standard shift: ${shiftHours}h`, `Overtime records: ${overtimeCount} (${fmtDuration(overtimeTotal)} total)`,
     `Total hours logged: ${fmtDuration(totalMinutes)}`, "",
-    "Recent entries:",
+    ...summary, "Recent entries:",
     ...rows.slice(0, 15).map((r) => {
       const ot = overtimeMinutes(r.total_minutes, shiftHours);
       return `- ${r.date} ${r.emp.name} (${r.emp.employee_number}): IN ${fmtTime(r.time_in)}${r.time_out ? ", OUT " + fmtTime(r.time_out) : " (still inside)"}${ot > 0 ? ` [OVERTIME +${fmtDuration(ot)}]` : ""}`;
@@ -316,11 +363,11 @@ function buildReportPayload(freq, employees, attendance, empById, settings) {
 
   const csvHeaders = [
     { label: "Date", get: (r) => r.date }, { label: "Employee", get: (r) => r.emp.name }, { label: "Employee ID", get: (r) => r.emp.employee_number },
-    { label: "Company", get: (r) => r.emp.company }, { label: "Time In", get: (r) => r.time_in }, { label: "Date Out", get: (r) => (r.time_out ? (r.date_out || r.date) : "") }, { label: "Time Out", get: (r) => r.time_out || "" },
-    { label: "Total Hours", get: (r) => r.total_minutes != null ? fmtDuration(r.total_minutes) : "" }, { label: "Overtime", get: (r) => fmtDuration(overtimeMinutes(r.total_minutes, shiftHours)) },
-    { label: "Status", get: (r) => r.status }, { label: "Recorded By", get: (r) => r.status === "INSIDE" ? r.checked_in_by : r.checked_out_by },
+    { label: "Company", get: (r) => r.emp.company }, { label: "Attendance Status", get: (r) => r.day_status || "PRESENT" }, { label: "Time In", get: (r) => r.time_in }, { label: "Date Out", get: (r) => (r.time_out ? (r.date_out || r.date) : "") }, { label: "Time Out", get: (r) => r.time_out || "" },
+    { label: "Total Hours", get: (r) => r.total_minutes != null ? fmtDuration(r.total_minutes) : "" }, { label: "Overtime", get: (r) => (r.day_status ? "" : fmtDuration(overtimeMinutes(r.total_minutes, shiftHours))) },
+    { label: "Status", get: (r) => r.status }, { label: "Recorded By", get: (r) => r.status === "INSIDE" ? r.checked_in_by : r.checked_out_by }, { label: "Leave / Absence Reason", get: (r) => r.day_reason || "" },
   ];
-  return { subject, body: lines.join("\n"), csv: toCSV(rows, csvHeaders), filename: `${freq}-report-${from}_${to}.csv`, label, rowCount: rows.length };
+  return { subject, body: lines.join("\n"), csv: toCSV(allRows, csvHeaders), filename: `${freq}-report-${from}_${to}.csv`, label, rowCount: allRows.length };
 }
 
 function buildSecurityReportPayload(freq, visitors) {
@@ -1607,7 +1654,7 @@ function getLocationCollection(db, locationId, collectionName) {
     if (!ch.recipient_email) { notify(`Add the recipient's email for ${sectionLabel} reports in Settings first`, "error"); return; }
 
     let payload;
-    if (section === "attendance") payload = buildReportPayload(freq, employees, attendance, empById, settings);
+    if (section === "attendance") payload = buildReportPayload(freq, employees, attendance, empById, settings, leaves);
     else if (section === "security") payload = buildSecurityReportPayload(freq, visitors);
     else if (section === "inventory") payload = buildInventoryReportPayload(freq, stockItems, stockMovements);
     else payload = buildShipmentReportPayload(freq, shipments, settings);
@@ -1625,7 +1672,7 @@ function getLocationCollection(db, locationId, collectionName) {
       } catch (e) { /* the failed save already showed an error */ }
     }
     notify(`${payload.label} ${sectionLabel.toLowerCase()} report ready — check your email app`);
-  }, [settings, employees, attendance, empById, visitors, stockItems, stockMovements, shipments, notify, session]);
+  }, [settings, employees, attendance, empById, leaves, visitors, stockItems, stockMovements, shipments, notify, session]);
 
   if (!booted) {
     return (
@@ -1713,7 +1760,7 @@ function getLocationCollection(db, locationId, collectionName) {
           />
         )}
         {view === "history" && (
-          <HistoryScreen attDays={attDays} onMoreHistory={() => setAttDays((d) => d + 120)} employees={employees} attendance={attendance} empById={empById} session={session} settings={settings}
+          <HistoryScreen leaves={leaves} attDays={attDays} onMoreHistory={() => setAttDays((d) => d + 120)} employees={employees} attendance={attendance} empById={empById} session={session} settings={settings}
             persistAttendance={persist.attendance} audit={audit} persistAudit={persist.audit} notify={notify} />
         )}
         {view === "leave" && (
@@ -1756,7 +1803,7 @@ function getLocationCollection(db, locationId, collectionName) {
           <EmployeesScreen employees={employees} persistEmployees={persist.employees} notify={notify} canEdit={session.role === "admin" && activeLocationId !== ALL_LOC} />
         )}
         {view === "reports" && ["admin","supervisor","manager","security_manager"].includes(session.role) && (
-          <ReportsScreen attDays={attDays} onMoreHistory={() => setAttDays((d) => d + 120)} employees={employees} attendance={attendance} empById={empById} settings={settings} />
+          <ReportsScreen leaves={leaves} attDays={attDays} onMoreHistory={() => setAttDays((d) => d + 120)} employees={employees} attendance={attendance} empById={empById} settings={settings} />
         )}
         {view === "settings" && session.role === "admin" && (
           <SettingsScreen settings={settings} persistSettings={persist.settings} users={users}
@@ -2118,7 +2165,7 @@ function LoginScreen({ authError, onClearAuthError, notify }) {
           <div style={{ width: 46, height: 2.5, background: C.aramexRed, borderRadius: 2, margin: "6px auto 14px" }} />
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
             <span style={{ width: 34, height: 1, background: C.line }} />
-            <span style={{ fontFamily: FONT_MONO, fontSize: 10.5, color: C.ink50, letterSpacing: 1.5 }}>DIGITAL GATE REGISTER · V2.0</span>
+            <span style={{ fontFamily: FONT_MONO, fontSize: 10.5, color: C.ink50, letterSpacing: 1.5 }}>DIGITAL GATE REGISTER · V2.0 · BUILD 13</span>
             <span style={{ width: 34, height: 1, background: C.line }} />
           </div>
         </div>
@@ -3185,7 +3232,7 @@ function AttendanceToday({ employees, attendance, empById, today, settings, leav
 /* ---------------------------------------------------------------------
    HISTORY
 --------------------------------------------------------------------- */
-function HistoryScreen({ employees, attendance, empById, session, persistAttendance, audit, persistAudit, notify, settings, attDays, onMoreHistory }) {
+function HistoryScreen({ employees, attendance, empById, session, persistAttendance, audit, persistAudit, notify, settings, attDays, onMoreHistory, leaves }) {
   const [filters, setFilters] = useState({ dateFrom: "", dateTo: "", employee: "", company: "", department: "", guard: "", status: "" });
   const [sortBy, setSortBy] = useState("latest");
   const [editing, setEditing] = useState(null);
@@ -3229,13 +3276,25 @@ function HistoryScreen({ employees, attendance, empById, session, persistAttenda
     const headers = [
       { label: "Date", get: (r) => r.date }, { label: "Employee", get: (r) => r.emp.name },
       { label: "Employee ID", get: (r) => r.emp.employee_number }, { label: "Company", get: (r) => r.emp.company },
-      { label: "Department", get: (r) => r.emp.department }, { label: "Time In", get: (r) => r.time_in },
+      { label: "Department", get: (r) => r.emp.department }, { label: "Attendance Status", get: (r) => r.day_status || "PRESENT" }, { label: "Time In", get: (r) => r.time_in },
       { label: "Date Out", get: (r) => (r.time_out ? (r.date_out || r.date) : "") }, { label: "Time Out", get: (r) => r.time_out || "" }, { label: "Total Hours", get: (r) => r.total_minutes != null ? fmtDuration(r.total_minutes) : "" },
-      { label: "Overtime", get: (r) => fmtDuration(overtimeMinutes(r.total_minutes, shiftHours)) },
+      { label: "Overtime", get: (r) => (r.day_status ? "" : fmtDuration(overtimeMinutes(r.total_minutes, shiftHours))) },
       { label: "Status", get: (r) => r.status }, { label: "Recorded By", get: (r) => r.status === "INSIDE" ? r.checked_in_by : r.checked_out_by },
-      { label: "Remarks", get: (r) => [r.remarks_in, r.remarks_out].filter(Boolean).join(" / ") },
+      { label: "Remarks", get: (r) => r.day_reason || [r.remarks_in, r.remarks_out].filter(Boolean).join(" / ") },
     ];
-    downloadFile(`attendance-history-${todayStr()}.csv`, toCSV(filtered, headers), "text/csv");
+    let out = filtered;
+    if (!filters.status && !filters.guard) {
+      const t0 = todayStr();
+      const cap = todayStr(new Date(Date.now() - 92 * 86400000));
+      const earliest = filtered.length ? filtered.reduce((m, r) => (r.date < m ? r.date : m), t0) : t0;
+      let from = filters.dateFrom || earliest;
+      const to = filters.dateTo || t0;
+      if (from < cap) from = cap;
+      const lc = (v) => String(v || "").toLowerCase();
+      const extra = buildStatusRows(from, to, employees, attendance, leaves).filter((r) => (!filters.employee || lc(r.emp.name).includes(lc(filters.employee)) || lc(r.emp.employee_number).includes(lc(filters.employee))) && (!filters.company || r.emp.company === filters.company) && (!filters.department || r.emp.department === filters.department));
+      if (extra.length) out = [...filtered, ...extra].sort(STATUS_CMP);
+    }
+    downloadFile(`attendance-history-${todayStr()}.csv`, toCSV(out, headers), "text/csv");
   };
 
   return (
@@ -3365,7 +3424,7 @@ function CorrectionModal({ record, onClose, attendance, persistAttendance, audit
    a date (or date range) so the gate and the dashboard show why they
    haven't checked in, instead of leaving it blank.
 --------------------------------------------------------------------- */
-const LEAVE_TYPES = ["Annual Leave", "Sick Leave", "Absent", "Other"];
+const LEAVE_TYPES = ["Annual Leave", "Sick Leave", "Day Off", "Absent", "Other"];
 
 /* ---------------------------------------------------------------------
    VISITORS & CONTRACTORS
@@ -7387,7 +7446,7 @@ function BulkAddModal({ employees, onClose, onAdd }) {
 /* ---------------------------------------------------------------------
    REPORTS (admin)
 --------------------------------------------------------------------- */
-function ReportsScreen({ employees, attendance, empById, settings, attDays, onMoreHistory }) {
+function ReportsScreen({ employees, attendance, empById, settings, attDays, onMoreHistory, leaves }) {
   const [tab, setTab] = useState("daily");
   return (
     <div>
@@ -7401,15 +7460,15 @@ function ReportsScreen({ employees, attendance, empById, settings, attDays, onMo
           }}>{l}</button>
         ))}
       </div>
-      {tab === "daily" && <PeriodReport mode="daily" employees={employees} attendance={attendance} empById={empById} settings={settings} />}
-      {tab === "weekly" && <PeriodReport mode="weekly" employees={employees} attendance={attendance} empById={empById} settings={settings} />}
-      {tab === "monthly" && <PeriodReport mode="monthly" employees={employees} attendance={attendance} empById={empById} settings={settings} />}
+      {tab === "daily" && <PeriodReport mode="daily" employees={employees} attendance={attendance} empById={empById} settings={settings} leaves={leaves} />}
+      {tab === "weekly" && <PeriodReport mode="weekly" employees={employees} attendance={attendance} empById={empById} settings={settings} leaves={leaves} />}
+      {tab === "monthly" && <PeriodReport mode="monthly" employees={employees} attendance={attendance} empById={empById} settings={settings} leaves={leaves} />}
       {tab === "employee" && <EmployeeReport employees={employees} attendance={attendance} settings={settings} />}
     </div>
   );
 }
 
-function PeriodReport({ mode, employees, attendance, empById, settings }) {
+function PeriodReport({ mode, employees, attendance, empById, settings, leaves }) {
   const [date, setDate] = useState(todayStr());
   const [month, setMonth] = useState(todayStr().slice(0, 7));
 
@@ -7430,6 +7489,8 @@ function PeriodReport({ mode, employees, attendance, empById, settings }) {
   const shiftHours = settings.shift_hours || 9;
   const rows = attendance.filter((a) => a.date >= from && a.date <= to).map((a) => ({ ...a, emp: empById[a.employee_id] })).filter((r) => r.emp);
   rows.sort((a, b) => (b.date + b.time_in).localeCompare(a.date + a.time_in));
+  const statusRows = buildStatusRows(from, to, employees, attendance, leaves);
+  const allRows = [...rows, ...statusRows].sort(STATUS_CMP);
   const overtimeTotal = rows.reduce((s, r) => s + overtimeMinutes(r.total_minutes, shiftHours), 0);
   const overtimeCount = rows.filter((r) => overtimeMinutes(r.total_minutes, shiftHours) > 0).length;
   const missingCheckout = rows.filter((r) => r.status === "INSIDE" && r.date < todayStr()).length;
@@ -7437,9 +7498,9 @@ function PeriodReport({ mode, employees, attendance, empById, settings }) {
 
   const headers = [
     { label: "Date", get: (r) => r.date }, { label: "Employee", get: (r) => r.emp.name }, { label: "Employee ID", get: (r) => r.emp.employee_number },
-    { label: "Company", get: (r) => r.emp.company }, { label: "Time In", get: (r) => r.time_in }, { label: "Date Out", get: (r) => (r.time_out ? (r.date_out || r.date) : "") }, { label: "Time Out", get: (r) => r.time_out || "" },
+    { label: "Company", get: (r) => r.emp.company }, { label: "Attendance Status", get: (r) => r.day_status || "PRESENT" }, { label: "Time In", get: (r) => r.time_in }, { label: "Date Out", get: (r) => (r.time_out ? (r.date_out || r.date) : "") }, { label: "Time Out", get: (r) => r.time_out || "" },
     { label: "Total Hours", get: (r) => r.total_minutes != null ? fmtDuration(r.total_minutes) : "" }, { label: "Status", get: (r) => r.status },
-    { label: "Overtime", get: (r) => fmtDuration(overtimeMinutes(r.total_minutes, shiftHours)) }, { label: "Recorded By", get: (r) => r.status === "INSIDE" ? r.checked_in_by : r.checked_out_by },
+    { label: "Overtime", get: (r) => (r.day_status ? "" : fmtDuration(overtimeMinutes(r.total_minutes, shiftHours))) }, { label: "Recorded By", get: (r) => r.status === "INSIDE" ? r.checked_in_by : r.checked_out_by }, { label: "Leave / Absence Reason", get: (r) => r.day_reason || "" },
   ];
 
   return (
@@ -7450,10 +7511,13 @@ function PeriodReport({ mode, employees, attendance, empById, settings }) {
         ) : (
           <Field label={mode === "weekly" ? "Any date in week" : "Date"}><input type="date" style={inputStyle} value={date} onChange={(e) => setDate(e.target.value)} /></Field>
         )}
-        <Btn size="sm" tone="paper" icon={Download} onClick={() => downloadFile(`${mode}-report-${from}_${to}.csv`, toCSV(rows, headers), "text/csv")}>CSV</Btn>
+        <Btn size="sm" tone="paper" icon={Download} onClick={() => downloadFile(`${mode}-report-${from}_${to}.csv`, toCSV(allRows, headers), "text/csv")}>CSV</Btn>
         <Btn size="sm" tone="paper" icon={FileDown} onClick={() => window.print()}>PDF (Print)</Btn>
       </div>
 
+      <div style={{ fontSize: 12.5, color: C.ink, marginBottom: 12, lineHeight: 1.6 }}>
+        Present: <b>{new Set(rows.map((r) => r.employee_id + r.date)).size}</b> · Annual leave: <b>{statusRows.filter((r) => r.day_status === "ANNUAL LEAVE").length}</b> · Sick leave: <b>{statusRows.filter((r) => r.day_status === "SICK LEAVE").length}</b> · Day off: <b>{statusRows.filter((r) => r.day_status === "DAY OFF").length}</b> · Absent: <b>{statusRows.filter((r) => r.day_status === "ABSENT").length}</b> · Other leave: <b>{statusRows.filter((r) => r.day_status === "OTHER LEAVE").length}</b> · Not checked in: <b>{statusRows.filter((r) => r.day_status === "NOT CHECKED IN").length}</b>
+      </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))", gap: 10, marginBottom: 16 }}>
         <StatCard label="Period" value={label} icon={CalendarDays} tone="navy" />
         <StatCard label="Total Records" value={rows.length} icon={ClipboardList} tone="slate" />
@@ -7464,7 +7528,7 @@ function PeriodReport({ mode, employees, attendance, empById, settings }) {
       </div>
 
       <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden" }}>
-        {rows.length === 0 ? <EmptyState icon={BarChart3} title="No attendance in this period" /> : (
+        {allRows.length === 0 ? <EmptyState icon={BarChart3} title="No attendance in this period" /> : (
           <TableScroll headers={["Date", "Employee", "ID", "Time In", "Time Out", "Hours", "Status"]}>
             {rows.map((r) => (
               <tr key={r.id}>
@@ -7472,6 +7536,10 @@ function PeriodReport({ mode, employees, attendance, empById, settings }) {
                 <TdMono>{fmtTime(r.time_in)}</TdMono><TdMono>{fmtTimeOut(r)}</TdMono>
                 <Td>{r.total_minutes != null ? fmtDuration(r.total_minutes) : "—"}</Td><Td><StatusBadge a={r} shiftHours={settings.shift_hours} /></Td>
               </tr>
+            ))}
+          {statusRows.map((r) => (
+              <tr key={r.emp.id + r.date}><Td>{r.date}</Td><Td>{r.emp.name}</Td><TdMono>{r.emp.employee_number}</TdMono><Td>—</Td><Td>—</Td><Td>—</Td>
+                <Td><Badge tone={r.day_status === "ABSENT" || r.day_status === "SICK LEAVE" || r.day_status === "NOT CHECKED IN" ? "missing" : "neutral"}>{r.day_status}</Badge></Td></tr>
             ))}
           </TableScroll>
         )}
@@ -7917,7 +7985,7 @@ function SettingsScreen({ settings, persistSettings, users, persistUsers, notify
 
   return (
     <div>
-      <SectionTitle title="Settings" />
+      <SectionTitle title="Settings" sub="Build 13 · attendance reports include leave, day off, absent and not checked in" />
 
       <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 16, marginBottom: 16 }}>
         <h3 style={{ fontFamily: FONT_SERIF, fontSize: 16, margin: "0 0 4px" }}>Devices &amp; Syncing</h3>
